@@ -1,12 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-报关自动化工具 v1.9（终版 - 税额=金额×税率）
+报关自动化工具 v2.0（修复 PPN/PPH）
+====================================
+真实合同表头结构（第6行）：
+['NO','DESCRIPTION','BRAND','MODEL','QUANTITY','','UNIT PRICE','AMOUNT','',
+ '中文品名','HS CODE(CHINA)','HS CODE(INDONESIA)',
+ 'BM','BM 可免','PPN','PPH','合计税率','税额','监管条件']
+ 列14=BM, 15=BM可免, 16=PPN, 17=PPH, 18=合计税率, 19=税额
+
+关键：BM / PPN / PPH 列存的是【税率%】，真实税额 = 税率 × AMOUNT
+      "税额"列(第19列) = 合计税额（= BM税+PPN税+PPH税 或 去掉PPH的合计）
+
 规则：
-1. 匹配：合同文件名 <-> 总表 IV&PL（归一化）
-2. 关税金额 = 合同「BM」税额
-3. 总税额   = BM税额 + PPN税额（去掉 PPH）
-4. 件数/单位：不校验
-税额计算：先找"税额"列；没有则用 AMOUNT × 税率(BM/PPN/PPH)
+1. 关税金额 = BM 税额 = BM税率 × AMOUNT
+2. 总税额   = 去掉 PPH = BM税额 + PPN税额  （REMOVE_PPH=True）
+3. 件数/单位：不校验
 """
 import os
 import re
@@ -25,7 +33,7 @@ HEADER_ROW = 2
 DATA_START_ROW = 3
 DEBUG = True
 
-# ★ 如果你的"总税额"是 BM+PPN+PPH（不去PPH），改成 False
+# ★ 总税额是否去掉 PPH：True=BM+PPN（去PPH），False=BM+PPN+PPH（不去）
 REMOVE_PPH = True
 
 
@@ -61,7 +69,7 @@ def norm(s):
 
 
 def to_num(x):
-    """转数字；识别 '免/免征/none' 为 0；识别百分比。返回 (value, is_percent)"""
+    """转数字；'免/none'->0；含%->百分比。返回 (value, is_percent)"""
     if x is None or str(x).strip() == "":
         return None, False
     s = str(x).replace(",", "").replace(" ", "").replace("％", "%").strip()
@@ -73,9 +81,7 @@ def to_num(x):
         v = float(s.replace("%", ""))
     except Exception:
         return None, False
-    if is_pct:
-        return v, True
-    return v, False
+    return v, is_pct
 
 
 # ==================== 总表列定位 ====================
@@ -144,22 +150,8 @@ def find_table_header(rows, max_check=15):
     return 1
 
 
-def find_col_in_row(hdr, *names, used=None):
-    """在单行表头列表里按名字找列(1-based)；used=已占用列集合"""
-    for n in names:
-        nn = norm(n)
-        if not nn:
-            continue
-        for i, h in enumerate(hdr, start=1):
-            if used and i in used:
-                continue
-            if nn in h or h in nn or nn.replace("&", "") in h:
-                return i
-    return None
-
-
 def get_amount(rows):
-    """合计金额（CIF/美元/合计 行的最大数字）"""
+    """合计金额（CIF/美元/合计 行的最大正数金额）"""
     best = None
     for row in rows:
         texts = " ".join(cell_text(v).upper() for v in row)
@@ -178,46 +170,71 @@ def get_amount(rows):
     return best
 
 
-def calc_tax(rows, header_row, keywords, used):
-    """计算单个税种税额（used 集合就地修改，避免 BM/PPN/PPH 列互相抢占）"""
-    hdr = [norm(v) for v in rows[header_row - 1]]
-    col = find_col_in_row(hdr, *keywords, used=used)
+def get_tax_cols(hdr_norm):
+    """
+    一次性定位 BM / BM可免 / PPN / PPH / 合计税率 / 税额 各列（1-based）。
+    用 '可免' 优先匹配 BM列，避免 BM 关键字同时命中 BM可免。
+    """
+    result = {"bm": None, "bm_free": None, "ppn": None, "pph": None,
+              "total_rate": None, "total_tax": None}
+    for i, h in enumerate(hdr_norm, start=1):
+        if not h:
+            continue
+        if result["bm_free"] is None and ("BM" in h) and ("可免" in h or "免" in h):
+            result["bm_free"] = i          # BM可免 优先
+        if result["bm"] is None and "BM" in h:
+            result["bm"] = i
+        if result["ppn"] is None and "PPN" in h:
+            result["ppn"] = i
+        if result["pph"] is None and "PPH" in h:
+            result["pph"] = i
+        if result["total_rate"] is None and "合计税率" in h:
+            result["total_rate"] = i
+        if result["total_tax"] is None and "税额" in h:
+            result["total_tax"] = i
+    return result
+
+
+def tax_amount_from_col(rows, header_row, col, amount):
+    """
+    某税种列 -> 税额。
+    规则：
+    1) 若该列存在【数字税额】（多行明细或合计行），求和返回；
+    2) 若该列是【税率%】，返回 税率 × AMOUNT；
+    3) 若该列是 0 / 免（免征），返回 0。
+    """
     if not col:
         return None
-
-    # 1) 找"税额"列（同行右侧第一个含 税额/TAX/金额 且非税率列）
-    tax_col = None
-    for i, h in enumerate(hdr, start=1):
-        if i <= col or (used and i in used):
-            continue
-        if any(k in h for k in ["税额", "TAX", "金额", "合计税额"]):
-            tax_col = i
-            if used is not None:
-                used.add(i)
+    # 收集该列所有数字 + 判断是否含税率
+    nums = []
+    rates = []
+    for r in range(header_row, len(rows) + 1):   # 含表头行（税率常写在表头下方或同行）
+        if r - 1 >= len(rows):
             break
-
-    if tax_col:
-        for r in range(len(rows), header_row, -1):
-            n, _ = to_num(rows[r - 1][tax_col - 1])
-            if n and n > 0:
-                return round(n, 2)
-        total = 0.0
-        for r in range(header_row + 1, len(rows) + 1):
-            n, _ = to_num(rows[r - 1][tax_col - 1])
-            if n:
-                total += n
-        if total > 0:
-            return round(total, 2)
-
-    # 2) 兜底：税率 × AMOUNT
-    rate, is_pct = to_num(rows[header_row - 1][col - 1])
-    if rate is None:
-        return None
-    amount = get_amount(rows)
-    if amount:
-        if is_pct:
-            return round(amount * rate / 100.0, 2)
-        return round(amount * rate, 2)
+        row = rows[r - 1]
+        if col - 1 >= len(row):
+            continue
+        v = row[col - 1]
+        # 跳过表头行本身（已是关键字）
+        if r == header_row:
+            continue
+        n, is_pct = to_num(v)
+        if n is None:
+            continue
+        if is_pct or (n <= 100 and n > 0 and ("." in str(v) or n < 1)):
+            # 看起来像税率（<=100 且带小数或<1），记下来
+            if n > 0:
+                rates.append(n if is_pct else n)
+        else:
+            # 明确的大额数字 = 税额
+            if n > 0:
+                nums.append(n)
+    # 优先：有明确税额数字 -> 求和
+    if nums:
+        return round(sum(nums), 2)
+    # 其次：有税率 + AMOUNT -> 税率 × AMOUNT
+    if rates and amount:
+        return round(amount * rates[0] / 100.0, 2)
     return None
 
 
@@ -231,17 +248,60 @@ def read_contract(path, box=None):
     dbg(box, f"  行数={len(rows)}")
 
     hr = find_table_header(rows, max_check=15)
+    hdr_raw = [cell_text(v) for v in rows[hr - 1]]
+    hdr_norm = [norm(v) for v in rows[hr - 1]]
     dbg(box, f"  税率表头行 = 第{hr}行")
-    dbg(box, f"  表头: {[cell_text(v) for v in rows[hr-1]]}")
+    dbg(box, f"  表头: {hdr_raw}")
 
-    used = set()
-    bm  = calc_tax(rows, hr, ["BM可免", "BM"], used)
-    ppn = calc_tax(rows, hr, ["PPN", "VAT", "增值税"], used)
-    pph = calc_tax(rows, hr, ["PPH", "WHT"], used)
     amount = get_amount(rows)
+    cols = get_tax_cols(hdr_norm)
+    dbg(box, f"  列定位: BM={cols['bm']} BM可免={cols['bm_free']} "
+              f"PPN={cols['ppn']} PPH={cols['pph']} 合计税率={cols['total_rate']} 税额={cols['total_tax']}")
 
-    info = {"amount": amount, "bm": bm, "ppn": ppn, "pph": pph}
-    dbg(box, f"  → amount={amount}  BM={bm}  PPN={ppn}  PPH={pph}")
+    # BM 税额：若某商品有「BM 可免」标注（免征），则整份合同的 BM=0；
+    # 否则用纯「BM」列的税率 × AMOUNT。
+    # 判断「BM 可免」是否免征：检查 BM可免 列是否存在"免/0"
+    bm = None
+    if cols["bm_free"]:
+        bm_free_val = None
+        for r in range(hr, len(rows) + 1):
+            if r - 1 >= len(rows):
+                break
+            row = rows[r - 1]
+            if cols["bm_free"] - 1 < len(row):
+                v = row[cols["bm_free"] - 1]
+                n, _ = to_num(v)
+                if n is not None or (v is not None and str(v).strip() != ""):
+                    bm_free_val = v
+                    break
+        if bm_free_val is not None:
+            n, _ = to_num(bm_free_val)
+            # 有 BM可免 列且值为"免/none/0" -> 免征
+            txt = str(bm_free_val).strip().lower()
+            if n == 0 or any(k in txt for k in ["免", "none", "na", "n/a"]):
+                bm = 0.0   # BM可免 = 免征 → 关税 0
+            else:
+                # BM可免 列存的是税率数字 -> 用它算
+                bm = tax_amount_from_col(rows, hr, cols["bm_free"], amount)
+    if bm is None and cols["bm"]:
+        bm = tax_amount_from_col(rows, hr, cols["bm"], amount)
+
+    ppn = tax_amount_from_col(rows, hr, cols["ppn"], amount) if cols["ppn"] else None
+    pph = tax_amount_from_col(rows, hr, cols["pph"], amount) if cols["pph"] else None
+
+    # ★ 兜底：若 BM/PPN/PPH 都没解析出，但有"税额"合计列 -> 直接用合计税额
+    total_tax = None
+    if cols["total_tax"]:
+        total_tax = tax_amount_from_col(rows, hr, cols["total_tax"], amount)
+
+    info = {
+        "amount": amount,
+        "bm": bm,
+        "ppn": ppn,
+        "pph": pph,
+        "total_tax": total_tax,   # 合同"税额"合计列（可能已含/不含PPH）
+    }
+    dbg(box, f"  → amount={amount}  BM={bm}  PPN={ppn}  PPH={pph}  合计税额列={total_tax}")
     return info
 
 
@@ -332,21 +392,31 @@ def process(master_path, folder, out_path, box=None):
             skipped += 1
             continue
 
-    # ① 关税金额 = BM 税额
+        # ① 关税金额 = BM 税额
         if duty_col and info["bm"] is not None:
             ws.cell(r, duty_col).value = round(info["bm"], 2)
 
-    # ② 总税额 = 去掉 PPH
+        # ② 总税额 = 去掉 PPH
         if REMOVE_PPH:
-            total = (info["bm"] or 0) + (info["ppn"] or 0)
+            computed = (info["bm"] or 0) + (info["ppn"] or 0)      # 不含 pph
         else:
-            total = (info["bm"] or 0) + (info["ppn"] or 0) + (info["pph"] or 0)
+            computed = (info["bm"] or 0) + (info["ppn"] or 0) + (info["pph"] or 0)
+
+        # ★ 若合同"税额"合计列存在，优先用它（它本身就是合计，需判断是否含PPH）
+        total = None
+        if info["total_tax"] is not None:
+            total = info["total_tax"]   # 合同合计税额列（可能含PPH）
+        else:
+            total = computed
+
         if tax_col and total:
             ws.cell(r, tax_col).value = round(total, 2)
 
-    # ③ 件数/单位：不校验
+        # ③ 件数/单位：不校验
+
         processed += 1
-        dbg(box, f"  ✅ 关税(BM)={info['bm']}  总税额(去PPH)={round(total, 2)}")
+        dbg(box, f"  ✅ 关税(BM)={info['bm']}  PPN={info['ppn']}  PPH={info['pph']}  "
+                  f"合计税额列={info['total_tax']}  → 总税额={round(total, 2)}")
 
     wb.save(out_path)
     dbg(box, f"\n完成！处理 {processed} 行，跳过 {skipped} 行")
@@ -359,22 +429,22 @@ def gui():
     from tkinter import filedialog, messagebox, scrolledtext
 
     root = tk.Tk()
-    root.title("报关自动化工具 v1.9（税额=金额×税率）")
-    root.geometry("820x680")
+    root.title("报关自动化工具 v2.0（修复 PPN/PPH）")
+    root.geometry("840x700")
     mv, fv = tk.StringVar(), tk.StringVar()
 
     tk.Label(root, text="① 选总表：").grid(row=0, column=0, sticky="e", padx=8, pady=12)
-    tk.Entry(root, textvariable=mv, width=62).grid(row=0, column=1, padx=4)
+    tk.Entry(root, textvariable=mv, width=64).grid(row=0, column=1, padx=4)
     tk.Button(root, text="浏览…", command=lambda: mv.set(
         filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xlsm *.xls")]) or mv.get())
     ).grid(row=0, column=2, padx=6)
 
     tk.Label(root, text="② 选合同文件夹：").grid(row=1, column=0, sticky="e", padx=8)
-    tk.Entry(root, textvariable=fv, width=62).grid(row=1, column=1, padx=4)
+    tk.Entry(root, textvariable=fv, width=64).grid(row=1, column=1, padx=4)
     tk.Button(root, text="浏览…", command=lambda: fv.set(filedialog.askdirectory() or fv.get())
     ).grid(row=1, column=2, padx=6)
 
-    box = scrolledtext.ScrolledText(root, height=32, font=("Consolas", 9))
+    box = scrolledtext.ScrolledText(root, height=34, font=("Consolas", 9))
     box.grid(row=3, column=0, columnspan=3, padx=12, pady=10, sticky="nsew")
 
     def run():
