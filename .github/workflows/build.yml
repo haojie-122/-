@@ -23,14 +23,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install pyinstaller openpyxl xlrd
 
-      - name: 打包成 exe（单文件 / 无黑框 / 中文名）
+      - name: 打包成 exe（单文件 / 无黑框 / 64位）
         run: pyinstaller -F -w -n 报关自动化工具 single.py
 
       - name: 发布到 Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.11
-          name: 报关自动化工具 v1.0.11（精确税额解析）
+          tag_name: v1.0.12
+          name: 报关自动化工具 v1.0.12（容错增强 · 税额精确对齐）
           files: dist/报关自动化工具.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
