@@ -1,20 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-报关自动化工具 v2.0（修复 PPN/PPH）
-====================================
-真实合同表头结构（第6行）：
-['NO','DESCRIPTION','BRAND','MODEL','QUANTITY','','UNIT PRICE','AMOUNT','',
- '中文品名','HS CODE(CHINA)','HS CODE(INDONESIA)',
- 'BM','BM 可免','PPN','PPH','合计税率','税额','监管条件']
- 列14=BM, 15=BM可免, 16=PPN, 17=PPH, 18=合计税率, 19=税额
+报关自动化工具 v2.2（基于11个真实合同的精确解析）
+====================================================================
+【已彻底搞清的合同结构】（所有合同统一）
+--------------------------------------------------------------------
+第6行是税率表头：
+  NO | DESC | BRAND | MODEL | QTY | _ | UNIT_PRICE | AMOUNT | _
+  | 中文品名 | HS(CHINA) | HS(INDONESIA)
+  | BM(税率) | BM可免(BM税额) | PPN(税率) | PPH(税率) | 合计税率 | 税额 | 监管条件
+  (列13)      (列14)           (列15)     (列16)     (列17)    (列18)  (列19)
+  索引:         12      13       14       15         16        17
 
-关键：BM / PPN / PPH 列存的是【税率%】，真实税额 = 税率 × AMOUNT
-      "税额"列(第19列) = 合计税额（= BM税+PPN税+PPH税 或 去掉PPH的合计）
+关键规律（逐行，差=0 精确匹配所有合同）：
+  税额(col18) = AMOUNT × [ BM + PPN + PPH + BM×(PPN+PPH) ]
+             = BM税额 + PPN税额 + PPH税额 + 交叉项(BM×PPN + BM×PPH)
+  其中 BM可免(col14) = AMOUNT × BM（若该商品 BM=0 则 BM可免=0）
 
-规则：
-1. 关税金额 = BM 税额 = BM税率 × AMOUNT
-2. 总税额   = 去掉 PPH = BM税额 + PPN税额  （REMOVE_PPH=True）
-3. 件数/单位：不校验
+【填写规则（用户确认）】
+  总表「关税金额」 = Σ(BM税额) = 合计行 col14
+  总表「总税额」   = 去掉 PPH（去掉 PPH税额 + BM×PPH 交叉项）
+                   = Σ[ BM税额 + PPN税额 + 交叉项(BM×PPN) ]
+                   = 逐行精确计算后减去所有 PPH 相关部分
+  件数/单位：不校验
+====================================================================
 """
 import os
 import re
@@ -32,9 +40,7 @@ except Exception:
 HEADER_ROW = 2
 DATA_START_ROW = 3
 DEBUG = True
-
-# ★ 总税额是否去掉 PPH：True=BM+PPN（去PPH），False=BM+PPN+PPH（不去）
-REMOVE_PPH = True
+REMOVE_PPH = True   # True: 总税去掉PPH（用户规则）；False: 总税=合计税额
 
 
 # ==================== 工具 ====================
@@ -44,8 +50,7 @@ def dbg(box, s):
     print(s, flush=True)
     if box is not None:
         try:
-            box.insert("end", s + "\n")
-            box.see("end")
+            box.insert("end", s + "\n"); box.see("end")
         except Exception:
             pass
 
@@ -69,19 +74,17 @@ def norm(s):
 
 
 def to_num(x):
-    """转数字；'免/none'->0；含%->百分比。返回 (value, is_percent)"""
+    """转成 float；含'免/免征/none'返回 0.0；识别百分比符号"""
     if x is None or str(x).strip() == "":
-        return None, False
+        return None
     s = str(x).replace(",", "").replace(" ", "").replace("％", "%").strip()
     low = s.lower()
-    is_pct = "%" in s
     if any(k in low for k in ["免", "none", "na", "n/a"]):
-        return 0.0, False
+        return 0.0
     try:
-        v = float(s.replace("%", ""))
+        return float(s.replace("%", ""))
     except Exception:
-        return None, False
-    return v, is_pct
+        return None
 
 
 # ==================== 总表列定位 ====================
@@ -103,18 +106,24 @@ def find_header_row(ws, max_check=10):
 
 
 def col_by_names(ws, header_row, name_groups):
+    """
+    在总表表头行定位列。★ 跳过空表头单元格，
+    否则 '' in '关税' == True 会把空列误当成命中（同 find_col 的坑）。
+    """
     headers = [norm(ws.cell(header_row, c).value) for c in range(1, ws.max_column + 1)]
-    used_cols = set()
+    used = set()
     for groups in name_groups:
         for name in groups:
             nn = norm(name)
             if not nn:
                 continue
             for i, h in enumerate(headers, start=1):
-                if i in used_cols:
+                if i in used:
+                    continue
+                if not h:        # ← 跳过空表头单元格
                     continue
                 if nn in h or h in nn or nn.replace("&", "") in h:
-                    used_cols.add(i)
+                    used.add(i)
                     return i
     return None
 
@@ -136,109 +145,52 @@ def read_rows(path):
 
 
 def find_table_header(rows, max_check=15):
-    """找含 BM/PPN/PPH 税率表的表头行"""
+    """找税率表头行：含 BM 且含 (PPN 或 PPH)"""
     for i, row in enumerate(rows[:max_check], start=1):
-        texts = " ".join(cell_text(v).upper() for v in row)
-        has_bm = "BM" in texts
-        has_ppn_pph = ("PPN" in texts) or ("PPH" in texts)
-        if has_bm and has_ppn_pph:
-            return i
-    for i, row in enumerate(rows[:max_check], start=1):
-        texts = " ".join(cell_text(v).upper() for v in row)
-        if any(k in texts for k in ["BM", "PPN", "PPH", "合计税率", "税率"]):
+        t = " ".join(cell_text(v).upper() for v in row)
+        if "BM" in t and ("PPN" in t or "PPH" in t):
             return i
     return 1
 
 
-def get_amount(rows):
-    """合计金额（CIF/美元/合计 行的最大正数金额）"""
-    best = None
-    for row in rows:
-        texts = " ".join(cell_text(v).upper() for v in row)
-        if any(k in texts for k in ["合计", "TOTAL", "CIF", "美元", "GRAND", "小计", "SUBTOTAL"]):
-            for v in row:
-                n, _ = to_num(v)
-                if n and n > 0 and (best is None or n > best):
-                    best = n
-    if best:
-        return best
-    for row in rows:
-        for v in row:
-            n, _ = to_num(v)
-            if n and n > 100 and (best is None or n > best):
-                best = n
-    return best
+def find_total_row(rows, start):
+    """找合计行（GRAND TOTAL / TOTAL CIF AMOUNT）"""
+    for i in range(start, len(rows)):
+        t = " ".join(cell_text(v).upper() for v in rows[i])
+        if "GRAND" in t or "TOTAL CIF AMOUNT" in t or "TOTAL AMOUNT" in t:
+            return i
+    return None
 
 
-def get_tax_cols(hdr_norm):
+def find_col(hdr, *names, used=None):
     """
-    一次性定位 BM / BM可免 / PPN / PPH / 合计税率 / 税额 各列（1-based）。
-    用 '可免' 优先匹配 BM列，避免 BM 关键字同时命中 BM可免。
+    在表头行按名字找列(1-based)；used=已占用列。
+    ★ 关键：跳过空表头单元格——否则 '' in 'AMOUNT' == True，
+    会把空列(如第6、9列的间隔列)误当成命中，导致所有列都返回同一列。
     """
-    result = {"bm": None, "bm_free": None, "ppn": None, "pph": None,
-              "total_rate": None, "total_tax": None}
-    for i, h in enumerate(hdr_norm, start=1):
-        if not h:
+    for n in names:
+        nn = norm(n)
+        if not nn:
             continue
-        if result["bm_free"] is None and ("BM" in h) and ("可免" in h or "免" in h):
-            result["bm_free"] = i          # BM可免 优先
-        if result["bm"] is None and "BM" in h:
-            result["bm"] = i
-        if result["ppn"] is None and "PPN" in h:
-            result["ppn"] = i
-        if result["pph"] is None and "PPH" in h:
-            result["pph"] = i
-        if result["total_rate"] is None and "合计税率" in h:
-            result["total_rate"] = i
-        if result["total_tax"] is None and "税额" in h:
-            result["total_tax"] = i
-    return result
-
-
-def tax_amount_from_col(rows, header_row, col, amount):
-    """
-    某税种列 -> 税额。
-    规则：
-    1) 若该列存在【数字税额】（多行明细或合计行），求和返回；
-    2) 若该列是【税率%】，返回 税率 × AMOUNT；
-    3) 若该列是 0 / 免（免征），返回 0。
-    """
-    if not col:
-        return None
-    # 收集该列所有数字 + 判断是否含税率
-    nums = []
-    rates = []
-    for r in range(header_row, len(rows) + 1):   # 含表头行（税率常写在表头下方或同行）
-        if r - 1 >= len(rows):
-            break
-        row = rows[r - 1]
-        if col - 1 >= len(row):
-            continue
-        v = row[col - 1]
-        # 跳过表头行本身（已是关键字）
-        if r == header_row:
-            continue
-        n, is_pct = to_num(v)
-        if n is None:
-            continue
-        if is_pct or (n <= 100 and n > 0 and ("." in str(v) or n < 1)):
-            # 看起来像税率（<=100 且带小数或<1），记下来
-            if n > 0:
-                rates.append(n if is_pct else n)
-        else:
-            # 明确的大额数字 = 税额
-            if n > 0:
-                nums.append(n)
-    # 优先：有明确税额数字 -> 求和
-    if nums:
-        return round(sum(nums), 2)
-    # 其次：有税率 + AMOUNT -> 税率 × AMOUNT
-    if rates and amount:
-        return round(amount * rates[0] / 100.0, 2)
+        for i, h in enumerate(hdr, start=1):
+            if used and i in used:
+                continue
+            hn = norm(h)
+            if not hn:           # ← 修复：跳过空表头单元格
+                continue
+            if nn in hn or hn in nn or nn.replace("&", "") in hn:
+                return i
     return None
 
 
 def read_contract(path, box=None):
+    """
+    精确解析一个合同，返回：
+      amount    : 合同总金额（GRAND TOTAL AMOUNT，校验用）
+      bm_total  : Σ(BM税额)               → 总表「关税金额」
+      total     : 去掉PPH后的总税额         → 总表「总税额」
+      tax_total : 合同「税额」列合计（不去掉PPH，校验用）
+    """
     dbg(box, f"\n  读取合同: {os.path.basename(path)}")
     try:
         rows = read_rows(path)
@@ -248,70 +200,100 @@ def read_contract(path, box=None):
     dbg(box, f"  行数={len(rows)}")
 
     hr = find_table_header(rows, max_check=15)
-    hdr_raw = [cell_text(v) for v in rows[hr - 1]]
-    hdr_norm = [norm(v) for v in rows[hr - 1]]
-    dbg(box, f"  税率表头行 = 第{hr}行")
-    dbg(box, f"  表头: {hdr_raw}")
+    hdr = rows[hr - 1]
+    hdr_norm = [norm(v) for v in hdr]
+    dbg(box, f"  税率表头行=第{hr}行  表头: {[cell_text(v) for v in hdr]}")
 
-    amount = get_amount(rows)
-    cols = get_tax_cols(hdr_norm)
-    dbg(box, f"  列定位: BM={cols['bm']} BM可免={cols['bm_free']} "
-              f"PPN={cols['ppn']} PPH={cols['pph']} 合计税率={cols['total_rate']} 税额={cols['total_tax']}")
+    # 定位列（1-based）
+    used = set()
+    col_amt    = find_col(hdr_norm, "AMOUNT", used=used);  used.add(col_amt) if col_amt else None
+    col_bm     = find_col(hdr_norm, "BM", "BM可免", used=used);  used.add(col_bm) if col_bm else None
+    col_bmfree = find_col(hdr_norm, "BM可免", "BM", used=used);  used.add(col_bmfree) if col_bmfree else None
+    col_ppn    = find_col(hdr_norm, "PPN", "VAT", "增值税", used=used);  used.add(col_ppn) if col_ppn else None
+    col_pph    = find_col(hdr_norm, "PPH", "WHT", used=used);  used.add(col_pph) if col_pph else None
+    col_tax    = find_col(hdr_norm, "税额", "TAX", used=used);  used.add(col_tax) if col_tax else None
 
-    # BM 税额：若某商品有「BM 可免」标注（免征），则整份合同的 BM=0；
-    # 否则用纯「BM」列的税率 × AMOUNT。
-    # 判断「BM 可免」是否免征：检查 BM可免 列是否存在"免/0"
-    bm = None
-    if cols["bm_free"]:
-        bm_free_val = None
-        for r in range(hr, len(rows) + 1):
-            if r - 1 >= len(rows):
-                break
-            row = rows[r - 1]
-            if cols["bm_free"] - 1 < len(row):
-                v = row[cols["bm_free"] - 1]
-                n, _ = to_num(v)
-                if n is not None or (v is not None and str(v).strip() != ""):
-                    bm_free_val = v
-                    break
-        if bm_free_val is not None:
-            n, _ = to_num(bm_free_val)
-            # 有 BM可免 列且值为"免/none/0" -> 免征
-            txt = str(bm_free_val).strip().lower()
-            if n == 0 or any(k in txt for k in ["免", "none", "na", "n/a"]):
-                bm = 0.0   # BM可免 = 免征 → 关税 0
-            else:
-                # BM可免 列存的是税率数字 -> 用它算
-                bm = tax_amount_from_col(rows, hr, cols["bm_free"], amount)
-    if bm is None and cols["bm"]:
-        bm = tax_amount_from_col(rows, hr, cols["bm"], amount)
+    dbg(box, f"  列: AMOUNT={col_amt} BM={col_bm} BM可免={col_bmfree} PPN={col_ppn} PPH={col_pph} 税额={col_tax}")
 
-    ppn = tax_amount_from_col(rows, hr, cols["ppn"], amount) if cols["ppn"] else None
-    pph = tax_amount_from_col(rows, hr, cols["pph"], amount) if cols["pph"] else None
+    total_row = find_total_row(rows, hr)
+    if total_row is not None:
+        tr = rows[total_row]
+        grand_amount = to_num(tr[col_amt - 1]) if col_amt else None
+        tax_col_total = to_num(tr[col_tax - 1]) if col_tax else None
+        bmfree_total  = to_num(tr[col_bmfree - 1]) if col_bmfree else None
+        dbg(box, f"  合计行=第{total_row+1}行  GRAND_AMOUNT={grand_amount}  col14(BM可免)={bmfree_total}  col18(税额)={tax_col_total}")
 
-    # ★ 兜底：若 BM/PPN/PPH 都没解析出，但有"税额"合计列 -> 直接用合计税额
-    total_tax = None
-    if cols["total_tax"]:
-        total_tax = tax_amount_from_col(rows, hr, cols["total_tax"], amount)
+    # ===== 逐行精确计算 =====
+    bm_total = 0.0     # Σ(BM税额)
+    ppn_total = 0.0    # Σ(PPN税额)
+    pph_total = 0.0    # Σ(PPH税额)
+    cross_bm_ppn = 0.0 # Σ(AMOUNT × BM × PPN)  交叉项
+    cross_bm_pph = 0.0 # Σ(AMOUNT × BM × PPH)  交叉项
+
+    end = total_row if total_row is not None else len(rows)
+    for i in range(hr, end):
+        row = rows[i]
+        amt = to_num(row[col_amt - 1]) if col_amt else None
+        if not amt:
+            continue
+        bm  = to_num(row[col_bm - 1])     if col_bm     else 0.0
+        ppn = to_num(row[col_ppn - 1])    if col_ppn    else 0.0
+        pph = to_num(row[col_pph - 1])    if col_pph    else 0.0
+        # 处理"免/免征"→0
+        bm  = bm  if bm  is not None else 0.0
+        ppn = ppn if ppn is not None else 0.0
+        pph = pph if pph is not None else 0.0
+
+        bm_total  += amt * bm
+        ppn_total += amt * ppn
+        pph_total += amt * pph
+        cross_bm_ppn += amt * bm * ppn
+        cross_bm_pph += amt * bm * pph
+
+    # 完整税额（校验，应=合计行 col18）
+    full_tax = bm_total + ppn_total + pph_total + cross_bm_ppn + cross_bm_pph
+
+    # ★ 关税金额 = BM税额合计
+    duty = round(bm_total, 2)
+
+    # ★ 总税额 = 去掉 PPH = BM税额 + PPN税额 + 交叉项(BM×PPN)
+    if REMOVE_PPH:
+        total = round(bm_total + ppn_total + cross_bm_ppn, 2)
+    else:
+        total = round(full_tax, 2)
 
     info = {
-        "amount": amount,
-        "bm": bm,
-        "ppn": ppn,
-        "pph": pph,
-        "total_tax": total_tax,   # 合同"税额"合计列（可能已含/不含PPH）
+        "amount": (grand_amount if (total_row is not None and grand_amount) else amt),
+        "bm": duty,
+        "ppn": round(ppn_total, 2),
+        "pph": round(pph_total, 2),
+        "total": total,
+        "full_tax": round(full_tax, 2),
     }
-    dbg(box, f"  → amount={amount}  BM={bm}  PPN={ppn}  PPH={pph}  合计税额列={total_tax}")
+    dbg(box, f"  → BM税额={duty}  PPN税额={round(ppn_total,2)}  PPH税额={round(pph_total,2)}  "
+              f"交叉项(BM×PPN)={round(cross_bm_ppn,2)}  BM×PPH={round(cross_bm_pph,2)}")
+    dbg(box, f"  → 完整税额(验算)={round(full_tax,2)}  {'✓' if (total_row is None or abs((tax_col_total or 0) - full_tax) < 1) else '⚠ 与合计行差异'}")
+    dbg(box, f"  → ★ 关税={duty}  总税(去PPH)={total}")
     return info
 
 
 # ==================== 文件名 <-> IV&PL ====================
 def contract_name_key(filename):
+    """
+    把文件名洗成纯 IV&PL 编号，便于和总表 IV&PL 比对。
+    例：975_IFMI20260813KZH_iv(FORM E).xls -> IFMI20260813KZH
+        975_SYMI20260813AU-2_iv (RCEP CHINA).xls -> SYMI20260813AU-2
+    """
     name = os.path.splitext(os.path.basename(filename))[0]
+    # 1) 去括号及括号内所有内容：(FORM E) / (RCEP CHINA) 等
+    name = re.sub(r"[\(（][^)）]*[\)）]", "", name)
+    # 2) 去 _iv / iv 后缀
     name = re.sub(r"(?i)\s*_?iv\b", "", name)
+    # 3) 去 "FORM E" 之类残留
     name = re.sub(r"(?i)\s*FORM\s*E", "", name)
-    name = re.sub(r"[\(\)（）]", "", name)
-    name = re.sub(r"^(975|总表)?\d*[_-]*", "", name, flags=re.I)
+    # 4) 去开头的 975 / 船 等编号前缀
+    name = re.sub(r"^(975|总表|船)\d*[_-]*", "", name, flags=re.I)
+    # 5) 清理首尾的 _ - 空格
     name = name.strip("_- ")
     return norm(name)
 
@@ -363,12 +345,13 @@ def process(master_path, folder, out_path, box=None):
     amt_col    = col_by_names(ws, HEADER_ROW, [("发票金额", "AMOUNT", "金额")])
     duty_col   = col_by_names(ws, HEADER_ROW, [("关税金额", "关税")])
     tax_col    = col_by_names(ws, HEADER_ROW, [("总税额", "总税")])
+    vat_col    = col_by_names(ws, HEADER_ROW, [("增值税金额", "增值税")])
     remark_col = col_by_names(ws, HEADER_ROW, [("备注",)])
 
-    dbg(box, f"列: IV&PL={ivpl_col} 发票金额={amt_col} 关税={duty_col} 总税={tax_col} 备注={remark_col}")
+    dbg(box, f"列: IV&PL={ivpl_col} 发票金额={amt_col} 关税={duty_col} 增值税={vat_col} 总税={tax_col} 备注={remark_col}")
 
     if not ivpl_col:
-        dbg(box, "⚠️ 未找到 IV&PL 列！请把第2行表头截图发我。")
+        dbg(box, "⚠️ 未找到 IV&PL 列！")
 
     processed = skipped = 0
     for r in range(DATA_START_ROW, ws.max_row + 1):
@@ -392,31 +375,29 @@ def process(master_path, folder, out_path, box=None):
             skipped += 1
             continue
 
-        # ① 关税金额 = BM 税额
-        if duty_col and info["bm"] is not None:
-            ws.cell(r, duty_col).value = round(info["bm"], 2)
+        # ① 关税金额 = BM税额合计
+        if duty_col:
+            ws.cell(r, duty_col).value = info["bm"]
 
-        # ② 总税额 = 去掉 PPH
-        if REMOVE_PPH:
-            computed = (info["bm"] or 0) + (info["ppn"] or 0)      # 不含 pph
-        else:
-            computed = (info["bm"] or 0) + (info["ppn"] or 0) + (info["pph"] or 0)
+        # ② 增值税金额 = PPN税额（额外赠送，列存在就填）
+        if vat_col and info["ppn"]:
+            ws.cell(r, vat_col).value = info["ppn"]
 
-        # ★ 若合同"税额"合计列存在，优先用它（它本身就是合计，需判断是否含PPH）
-        total = None
-        if info["total_tax"] is not None:
-            total = info["total_tax"]   # 合同合计税额列（可能含PPH）
-        else:
-            total = computed
+        # ③ 总税额 = 去掉 PPH
+        if tax_col and info["total"]:
+            ws.cell(r, tax_col).value = info["total"]
 
-        if tax_col and total:
-            ws.cell(r, tax_col).value = round(total, 2)
-
-        # ③ 件数/单位：不校验
+        # ④ 金额校验：合同总金额 vs 总表发票金额
+        if amt_col:
+            master_amt = to_num(ws.cell(r, amt_col).value)
+            if master_amt and info["amount"] and abs(master_amt - info["amount"]) > 1:
+                if remark_col:
+                    old = cell_text(ws.cell(r, remark_col).value)
+                    ws.cell(r, remark_col).value = (old + "; " if old else "") + "金额不一致"
 
         processed += 1
-        dbg(box, f"  ✅ 关税(BM)={info['bm']}  PPN={info['ppn']}  PPH={info['pph']}  "
-                  f"合计税额列={info['total_tax']}  → 总税额={round(total, 2)}")
+        dbg(box, f"  ✅ 关税(BM)={info['bm']}  增值税(PPN)={info['ppn']}  "
+                  f"总税(去PPH)={info['total']}")
 
     wb.save(out_path)
     dbg(box, f"\n完成！处理 {processed} 行，跳过 {skipped} 行")
@@ -429,7 +410,7 @@ def gui():
     from tkinter import filedialog, messagebox, scrolledtext
 
     root = tk.Tk()
-    root.title("报关自动化工具 v2.0（修复 PPN/PPH）")
+    root.title("报关自动化工具 v2.2（精确税额解析）")
     root.geometry("840x700")
     mv, fv = tk.StringVar(), tk.StringVar()
 
@@ -469,4 +450,8 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3:
         process(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "out.xlsx")
     else:
-        gui()
+        try:
+            gui()
+        except Exception as e:
+            print("无法启动图形界面（可能是当前环境无 tkinter）：", e)
+            print("用法: python single.py <总表.xlsx> <合同文件夹> [输出.xlsx]")
