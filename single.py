@@ -1,303 +1,416 @@
-# 报关自动化工具 v1.4 —— 明确表头=第2行，数据从第3行开始
-import os, sys, glob, re, traceback
+# -*- coding: utf-8 -*-
+"""
+报关自动化工具 v1.6
+- 总表：表头第2行，数据从第3行开始
+- 匹配：合同【文件名】<-> 总表【IV&PL】（归一化）
+- 关税金额 = 合同 BM
+- 总税额   = 合同 PPH（无则 PPN）
+"""
+import os
+import re
+import sys
+import glob
+import traceback
 import openpyxl
 from openpyxl import load_workbook
 
+try:
+    import xlrd
+except Exception:
+    xlrd = None
+
+# ★★★★★ 修改这里即可 ★★★★★
+HEADER_ROW = 2        # 总表表头在第几行
+DATA_START_ROW = 3    # 总表数据从第几行开始
+# ★★★★★★★★★★★★★★★★★★★★
+
 DEBUG = True
 
-# ★★★ 你的总表：表头在第几行？改这里即可（1-based） ★★★
-HEADER_ROW = 2
-# ★★★ 数据从第几行开始？默认 = HEADER_ROW + 1 = 3 ★★★
-DATA_START_ROW = HEADER_ROW + 1
-
-HEADER_KEYWORDS = [
-    "IV&PL", "INVOICE", "发票", "合同号", "采购订单", "PO",
-    "关税", "增值税", "总税", "税额", "TAX", "DUTY",
-    "件数", "数量", "QTY", "QUANTITY",
-    "单位", "UNIT", "UOM",
-    "备注", "REMARK",
-    "AMOUNT", "TOTAL", "DESCRIPTION", "品名",
-    "毛重", "净重", "GROSS", "NET", "WEIGHT",
-    "体积", "VOLUME", "CBM",
-    "BL", "OBL", "LOADING", "PORT",
+CONTRACT_HEADER_KEYWORDS = [
+    "AMOUNT", "DESCRIPTION", "QTY", "QUANTITY", "UNIT", "BM", "PPN", "PPH",
+    "TOTAL", "PRICE", "HS CODE", "GROSS", "NET", "TAX", "DUTY", "VAT",
+    "发票", "金额", "品名", "件数", "单位", "关税", "增值税",
 ]
 
+
+# ==================== 工具函数 ====================
 def dbg(box, s):
-    if DEBUG:
-        print(s)
-        if box:
-            try: box.insert("end", s + "\n"); box.see("end")
-            except Exception: pass
-
-def num(x, default=0.0):
-    if x is None: return default
-    if isinstance(x, str):
-        s = x.strip().replace(",", "")
-        if not s: return default
-        try: return float(s)
-        except: return default
-    try: return float(x)
-    except: return default
-
-def txt(x):
-    if x is None: return ""
-    if hasattr(x, "value"):
-        return txt(x.value)
-    return str(x).strip()
-
-def norm_unit(s):
-    s = txt(s).lower()
-    s = (s.replace("sets","set").replace("set","set")
-          .replace("pieces","pc").replace("piece","pc").replace("pcs","pc")
-          .replace("kgs","kg").replace("cartons","ctn").replace("carton","ctn")
-          .replace("units","pc").replace("unit","pc"))
-    return s.strip()
-
-# ---------- 读合同 ----------
-def _pick_sheet(wb):
-    ws = None
-    for n in wb.sheetnames:
-        if "attach" in n.lower(): ws = wb[n]; break
-    if ws is None:
-        for n in wb.sheetnames:
-            if n.strip().upper() in ("CI","ATTACHMENT 1","ATTACHMENT","IV"):
-                ws = wb[n]; break
-    if ws is None: ws = wb.active
-    return ws
-
-def _make_info():
-    return dict(amount=None, bm=None, ppn_rate=11.0, ppn_amt=None,
-                qty=None, unit="", has_pph=False, has_bm=False)
-
-def _col(head, *keys):
-    for k in keys:
-        for i, h in enumerate(head):
-            hu = h.upper().replace(" ", "")
-            ku = k.upper().replace(" ", "")
-            if ku in hu and "PRICE" not in hu:
-                return i
-    return -1
-
-def read_contract(path, box=None):
-    ext = path.lower()
-    converted = None
-    if ext.endswith(".xls"):
+    if not DEBUG:
+        return
+    print(s, flush=True)
+    if box is not None:
         try:
-            import xlrd
-            return _read_xls_xlrd(path, box)
-        except Exception as e:
-            dbg(box, f"  xlrd失败: {e}")
-            try:
-                from win32com.client import Dispatch
-                xl = Dispatch("Excel.Application"); xl.Visible = False
-                wb = xl.Workbooks.Open(os.path.abspath(path))
-                tmp = os.path.join(os.path.dirname(path), "_tmp_convert.xlsx")
-                wb.SaveAs(os.path.abspath(tmp), 51); wb.Close(); xl.Quit()
-                converted = tmp; path = tmp
-            except Exception as e2:
-                dbg(box, f"  无法读xls: {e2}")
+            box.insert("end", s + "\n")
+            box.see("end")
+        except Exception:
+            pass
 
-    wb = load_workbook(path, data_only=True)
-    ws = _pick_sheet(wb)
 
-    # 合同表也自动找表头（通常第1行就是）
-    head = [txt(ws.cell(1, c).value).upper() for c in range(1, ws.max_column + 1)]
-    dbg(box, f"  合同表头: {head}")
+def num(x, default=None):
+    if x is None or str(x).strip() == "":
+        return default
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).replace(",", "").replace(" ", "").replace("￥", "").replace("$", "").strip()
+    try:
+        return float(s)
+    except Exception:
+        return default
 
-    i_amt  = _col(head, "AMOUNT","TOTAL","SUBTOTAL")
-    i_qty  = _col(head, "QTY","QUANTITY","PCS")
-    i_unit = _col(head, "UNIT","UOM")
-    i_bm   = _col(head, "BM","DUTY")
-    i_ppn  = _col(head, "PPN","VAT")
-    i_pph  = _col(head, "PPH","WITHHOLDING")
 
-    info = _make_info()
-    for r in range(2, ws.max_row + 1):
-        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
-        a = num(vals[i_amt]) if i_amt >= 0 else 0
-        if a: info["amount"] = max(info["amount"] or 0, a)
-        q = num(vals[i_qty]) if i_qty >= 0 else 0
-        if q: info["qty"] = q
-        u = txt(vals[i_unit]) if i_unit >= 0 else ""
-        if u: info["unit"] = u
-        b = num(vals[i_bm]) if i_bm >= 0 else 0
-        if b: info["bm"] = b; info["has_bm"] = True
-        p = num(vals[i_ppn]) if i_ppn >= 0 else 0
-        if p: info["ppn_amt"] = p
-        w = num(vals[i_pph]) if i_pph >= 0 else 0
-        if w: info["has_pph"] = True
+def cell_text(v):
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v)
 
-    wb.close()
-    if converted and os.path.exists(converted):
-        try: os.remove(converted)
-        except Exception: pass
-    return info
 
-def _read_xls_xlrd(path, box=None):
-    import xlrd
-    wb = xlrd.open_workbook(path)
-    sh = wb.sheet_by_index(0)
-    raw = [[sh.cell_value(r, c) for c in range(sh.ncols)] for r in range(min(sh.nrows, 200))]
-    head = [txt(c).upper() for c in raw[0]]
-    dbg(box, f"  [xls] 表头: {head}")
-
-    i_amt=_col(head,"AMOUNT","TOTAL"); i_bm=_col(head,"BM","DUTY")
-    i_ppn=_col(head,"PPN"); i_pph=_col(head,"PPH")
-    i_qty=_col(head,"QTY"); i_unit=_col(head,"UNIT")
-    info = _make_info()
-    for row in raw[1:]:
-        a=num(row[i_amt]) if i_amt>=0 else 0
-        if a: info["amount"]=max(info["amount"] or 0,a)
-        b=num(row[i_bm]) if i_bm>=0 else 0
-        if b: info["bm"]=b; info["has_bm"]=True
-        p=num(row[i_ppn]) if i_ppn>=0 else 0
-        if p: info["ppn_amt"]=p
-        w=num(row[i_pph]) if i_pph>=0 else 0
-        if w: info["has_pph"]=True
-        q=num(row[i_qty]) if i_qty>=0 else 0
-        if q: info["qty"]=q
-        u=txt(row[i_unit]) if i_unit>=0 else ""
-        if u: info["unit"]=u
-    return info
-
-# ---------- 匹配 ----------
 def norm(s):
-    return re.sub(r"[^A-Z0-9]", "", txt(s).upper())
+    """归一化：去空格、换行、括号统一、去 - _，转大写"""
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.replace("\n", " ").replace("\r", " ")
+    s = re.sub(r"\s+", "", s)
+    s = s.replace("（", "(").replace("）", ")")
+    s = s.replace("-", "").replace("_", "")
+    return s.strip().upper()
 
-def find_contract(folder, inv_key, box=None):
-    k = norm(inv_key)
-    dbg(box, f"  [匹配] 发票号归一化 = '{k}'")
-    if not k: return None
-    files = [p for p in glob.glob(os.path.join(folder, "*"))
-             if p.lower().endswith((".xls", ".xlsx"))]
-    dbg(box, f"  [匹配] 文件夹内候选合同数 = {len(files)}")
-    cores = re.sub(r"[^0-9A-Z]", "", k)
-    for p in files:
-        n = norm(os.path.basename(p))
-        if k in n or n in k:
-            dbg(box, f"  [匹配] 精确命中 -> {os.path.basename(p)}"); return p
-    for p in files:
-        n = norm(os.path.basename(p))
-        if cores and cores in n:
-            dbg(box, f"  [匹配] 模糊命中 -> {os.path.basename(p)}"); return p
-    dbg(box, "  [匹配] 未找到任何匹配合同")
+
+# ==================== 总表列定位 ====================
+def find_header_row(ws, max_check=10):
+    best = (0, 1)
+    for r in range(1, min(max_check, ws.max_row) + 1):
+        row = [cell_text(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)]
+        score = header_score(row)
+        if score > best[0]:
+            best = (score, r)
+    return best[1]
+
+
+def header_score(row):
+    s = " ".join(cell_text(v) for v in row).upper()
+    score = 0
+    keys = ["IV&PL", "INVOICE", "发票", "关税", "总税", "备注", "件数", "单位",
+            "AMOUNT", "DESCRIPTION", "QTY", "BM", "PPN", "PPH"]
+    for k in keys:
+        if k.replace("&", "") in s or k in s:
+            score += 1
+    return score
+
+
+def col_by_names(ws, header_row, name_groups):
+    headers = [norm(ws.cell(header_row, c).value) for c in range(1, ws.max_column + 1)]
+    for groups in name_groups:
+        for name in groups:
+            nn = norm(name)
+            if not nn:
+                continue
+            for i, h in enumerate(headers, start=1):
+                if nn in h or h in nn or nn.replace("&", "") in h:
+                    return i
     return None
 
-# ---------- 主处理 ----------
+
+# ==================== 合同读取 ====================
+def read_rows_xls(path):
+    if xlrd is None:
+        raise RuntimeError("未安装 xlrd，无法读取 .xls")
+    wb = xlrd.open_workbook(path)
+    sh = wb.sheet_by_index(0)
+    rows = [[sh.cell_value(r, c) for c in range(sh.ncols)] for r in range(sh.nrows)]
+    return rows
+
+
+def read_rows_xlsx(path):
+    wb = load_workbook(path, data_only=True, read_only=True)
+    ws = wb.active
+    rows = [list(row) for row in ws.iter_rows(values_only=True)]
+    wb.close()
+    return rows
+
+
+def detect_contract_header(rows):
+    """合同表头可能不是第1行（第1行常是公司名），找关键词最多的行"""
+    best = (0, 1)
+    for i, row in enumerate(rows[:15], start=1):
+        score = 0
+        for c in [cell_text(v).upper() for v in row]:
+            for kw in CONTRACT_HEADER_KEYWORDS:
+                if kw in c:
+                    score += 1
+        if score > best[0]:
+            best = (score, i)
+    return best[1]
+
+
+def find_col(headers_norm, *names):
+    for n in names:
+        nn = norm(n)
+        if not nn:
+            continue
+        for i, h in enumerate(headers_norm, start=1):
+            if nn in h or h in nn or nn.replace("&", "") in h:
+                return i
+    return None
+
+
+def extract_contract(rows):
+    hdr = detect_contract_header(rows)
+    headers_raw = [cell_text(v) for v in rows[hdr - 1]]
+    headers = [norm(v) for v in headers_raw]
+
+    bm_col   = find_col(headers, "BM", "关税", "DUTY", "BM可免")
+    ppn_col  = find_col(headers, "PPN", "VAT", "增值税")
+    pph_col  = find_col(headers, "PPH", "总税", "总税额", "WHT")
+    qty_col  = find_col(headers, "QTY", "件数", "数量")
+    unit_col = find_col(headers, "UNIT", "单位", "UOM")
+
+    def collect(col_idx):
+        vals = []
+        if not col_idx:
+            return vals
+        for row in rows[hdr:]:
+            if col_idx - 1 < len(row):
+                v = num(row[col_idx - 1])
+                if v is not None:
+                    vals.append(v)
+        return vals
+
+    bm_vals   = collect(bm_col)
+    ppn_vals  = collect(ppn_col)
+    pph_vals  = collect(pph_col)
+    qty_vals  = collect(qty_col)
+
+    info = {
+        "bm":   sum(bm_vals)   if bm_vals else None,
+        "ppn":  sum(ppn_vals)  if ppn_vals else None,
+        "pph":  sum(pph_vals)  if pph_vals else None,
+        "qty":  sum(qty_vals)  if qty_vals else None,
+        "unit": "",
+        "header_row": hdr,
+        "headers": headers_raw,
+        "bm_col": bm_col, "ppn_col": ppn_col, "pph_col": pph_col,
+        "qty_col": qty_col, "unit_col": unit_col,
+    }
+
+    if unit_col:
+        for row in rows[hdr:]:
+            if unit_col - 1 < len(row):
+                u = cell_text(row[unit_col - 1]).strip()
+                if u and u not in ("-", "/", ""):
+                    info["unit"] = u
+                    break
+
+    return info
+
+
+def read_contract(path, box=None):
+    ext = os.path.splitext(path)[1].lower()
+    dbg(box, f"  读取合同: {os.path.basename(path)} (ext={ext})")
+    try:
+        if ext == ".xls":
+            rows = read_rows_xls(path)
+        elif ext in (".xlsx", ".xlsm"):
+            rows = read_rows_xlsx(path)
+        else:
+            dbg(box, f"  不支持的扩展名: {ext}")
+            return None
+    except Exception as e:
+        dbg(box, f"  读取失败: {e}")
+        return None
+
+    dbg(box, f"  行数={len(rows)}")
+    info = extract_contract(rows)
+    dbg(box,
+        f"  表头行={info['header_row']}, "
+        f"列: bm={info['bm_col']} ppn={info['ppn_col']} pph={info['pph_col']} "
+        f"qty={info['qty_col']} unit={info['unit_col']}")
+    dbg(box, f"  → bm={info['bm']} ppn={info['ppn']} pph={info['pph']} qty={info['qty']} unit='{info['unit']}'")
+    return info
+
+
+# ==================== 文件名 <-> IV&PL 匹配 ====================
+def contract_name_key(filename):
+    """
+    975_LCMI20260813_iv FORM E.xls  ->  LCMI20260813
+    975_SYMI20260813AU-2_iv (RCEP CHINA).xls -> SYMI20260813AU2
+    """
+    name = os.path.splitext(os.path.basename(filename))[0]
+    name = re.sub(r"(?i)\s*_?iv\b", "", name)          # 去 _iv / iv
+    name = re.sub(r"(?i)\s*FORM\s*E", "", name)         # 去 FORM E
+    name = re.sub(r"[\(\)（）]", "", name)               # 去括号
+    name = re.sub(r"^(975|总表)?\d*[_-]*", "", name, flags=re.I)  # 去 975 前缀
+    name = name.strip("_- ")
+    return norm(name)
+
+
+def find_contract_file(folder, ivpl, box=None):
+    if not ivpl:
+        return None
+    key = norm(ivpl)
+    if not key:
+        return None
+
+    pattern = os.path.join(folder, "*")
+    candidates = [
+        p for p in glob.glob(pattern)
+        if os.path.isfile(p) and os.path.splitext(p)[1].lower() in (".xls", ".xlsx", ".xlsm")
+    ]
+
+    exact = None
+    contain = None
+    for p in candidates:
+        k = contract_name_key(p)
+        if k == key:
+            exact = p
+            break
+        if contain is None and (key in k or k in key):
+            contain = p
+
+    hit = exact or contain
+    if hit:
+        dbg(box, f"  [匹配] 命中 -> {os.path.basename(hit)}")
+        return hit
+
+    # 兜底：原始字符串包含
+    raw = re.sub(r"[\s_\-]", "", str(ivpl)).upper()
+    for p in candidates:
+        base = re.sub(r"[\s_\-()（）]", "", os.path.splitext(os.path.basename(p))[0]).upper()
+        if raw and raw in base:
+            dbg(box, f"  [匹配] 兜底命中 -> {os.path.basename(p)}")
+            return p
+
+    dbg(box, f"  [匹配] 未找到（文件夹内 {len(candidates)} 个文件）")
+    return None
+
+
+# ==================== 主处理 ====================
 def process(master_path, folder, out_path, box=None):
-    wb = load_workbook(master_path, data_only=True)
+    wb = load_workbook(master_path)
     ws = wb.active
     dbg(box, f"\n==== 总表 ====")
     dbg(box, f"Sheet: {ws.title}, 行={ws.max_row}, 列={ws.max_column}")
-    dbg(box, f"表头行=第{HEADER_ROW}行, 数据从第{DATA_START_ROW}行开始")
+    dbg(box, f"表头行={HEADER_ROW}, 数据从第{DATA_START_ROW}行开始")
 
-    head = [txt(ws.cell(HEADER_ROW, c).value) for c in range(1, ws.max_column + 1)]
-    dbg(box, f"表头(第{HEADER_ROW}行): {head}")
+    headers_raw = [cell_text(ws.cell(HEADER_ROW, c).value) for c in range(1, ws.max_column + 1)]
+    dbg(box, f"表头: {headers_raw}")
 
-    def C(*keys):
-        for k in keys:
-            for i, h in enumerate(head):
-                hu = h.upper().replace(" ", "")
-                ku = k.upper().replace(" ", "")
-                if ku in hu:
-                    dbg(box, f"  列匹配 '{k}' -> 第{i+1}列 ('{h}')")
-                    return i + 1
-        dbg(box, f"  列匹配 {keys} -> 未找到")
-        return None
+    ivpl_col = col_by_names(ws, HEADER_ROW, [("IV&PL", "INVOICE NO", "发票号", "INVOICE", "合同号")])
+    duty_col = col_by_names(ws, HEADER_ROW, [("关税金额", "关税")])
+    tax_col  = col_by_names(ws, HEADER_ROW, [("总税额", "总税")])
+    remark_col = col_by_names(ws, HEADER_ROW, [("备注",)])
+    qty_col  = col_by_names(ws, HEADER_ROW, [("件数", "数量", "QTY")])
+    unit_col = col_by_names(ws, HEADER_ROW, [("单位", "UNIT")])
 
-    c_inv  = C("IV&PL", "INVOICE NO", "发票号", "INVOICE", "合同号")
-    c_tax  = C("关税金额", "关税")
-    c_tot  = C("总税额", "总税")
-    c_note = C("备注")
-    c_qty  = C("件数", "数量", "QTY")
-    c_unit = C("单位", "UNIT")
+    dbg(box, f"列定位: IV&PL={ivpl_col} 关税={duty_col} 总税={tax_col} "
+              f"备注={remark_col} 件数={qty_col} 单位={unit_col}")
 
-    if not c_inv:
-        print("⚠️ 仍未找到发票号列！请把表头行(第2行)截图发我。", flush=True)
+    if not ivpl_col:
+        dbg(box, "⚠️ 未找到 IV&PL / 发票号 列！请把第2行表头截图发我。")
 
-    n_ok = n_skip = 0
+    processed = skipped = 0
     for r in range(DATA_START_ROW, ws.max_row + 1):
-        inv = txt(ws.cell(r, c_inv).value) if c_inv else ""
-        if not inv:
+        ivpl = ws.cell(r, ivpl_col).value if ivpl_col else None
+        if ivpl is None or str(ivpl).strip() == "":
             continue
-        dbg(box, f"\n--- 第{r}行 发票号='{inv}' ---")
-        cp = find_contract(folder, inv, box)
-        if not cp:
-            if c_note: ws.cell(r, c_note).value = "未找到合同"
-            n_skip += 1; continue
-        try:
-            info = read_contract(cp, box)
-        except Exception as e:
-            dbg(box, f"  读合同失败: {e}")
-            if c_note: ws.cell(r, c_note).value = "合同读取失败"
-            n_skip += 1; continue
+        ivpl_s = cell_text(ivpl).strip()
+        dbg(box, f"\n--- 第{r}行 发票号='{ivpl_s}' ---")
 
-        note = ""
-        if c_tax and info["bm"]:
-            ws.cell(r, c_tax).value = round(info["bm"], 2)
-        ppn = info["ppn_amt"]
-        if not ppn and info["amount"]:
-            ppn = round(info["amount"] * info["ppn_rate"] / 100.0, 2)
-        if c_tot and (info["bm"] or ppn):
-            ws.cell(r, c_tot).value = round((info["bm"] or 0) + (ppn or 0), 2)
-        if c_qty and c_unit and info["qty"]:
-            mq = num(ws.cell(r, c_qty).value)
-            mu = norm_unit(ws.cell(r, c_unit).value)
-            cu = norm_unit(info["unit"])
-            if (mq and mq != info["qty"]) or (mu and cu and mu != cu):
-                note = "单位不一致"
-        if note and c_note:
-            ws.cell(r, c_note).value = note
-        n_ok += 1
-        dbg(box, f"  [OK] 关税={info['bm']} 总税额={(info['bm'] or 0)+(ppn or 0)} {note}")
+        cp = find_contract_file(folder, ivpl_s, box)
+        if not cp:
+            if remark_col:
+                ws.cell(r, remark_col).value = "未找到合同"
+            skipped += 1
+            continue
+
+        info = read_contract(cp, box)
+        if info is None:
+            if remark_col:
+                ws.cell(r, remark_col).value = "合同读取失败"
+            skipped += 1
+            continue
+
+        # ===== 关税金额 = BM =====
+        if duty_col and info["bm"] is not None:
+            ws.cell(r, duty_col).value = round(info["bm"], 2)
+
+        # ===== 总税额：默认用 PPH；无 PPH 则用 PPN =====
+        # ★ 若你要 BM+PPN+PPH，把下面改成：total = (info["bm"] or 0)+(info["ppn"] or 0)+(info["pph"] or 0)
+        total = info["pph"]
+        if total is None:
+            total = info["ppn"]
+        if tax_col and total is not None:
+            ws.cell(r, tax_col).value = round(total, 2)
+
+        # ===== 备注：单位/件数不一致 =====
+        remarks = []
+        if qty_col and info["qty"] is not None:
+            master_qty = num(ws.cell(r, qty_col).value)
+            if master_qty is not None and abs(master_qty - info["qty"]) > 1e-6:
+                remarks.append("件数不一致")
+        if unit_col and info["unit"]:
+            master_unit = cell_text(ws.cell(r, unit_col).value).strip().lower()
+            if master_unit and master_unit != info["unit"].strip().lower():
+                remarks.append("单位不一致")
+        if remark_col:
+            old = cell_text(ws.cell(r, remark_col).value)
+            new = "; ".join(remarks) if remarks else old
+            ws.cell(r, remark_col).value = new
+
+        processed += 1
+        dbg(box, f"  ✅ 关税={info['bm']} 总税额={total} {('备注:' + ';'.join(remarks)) if remarks else ''}")
 
     wb.save(out_path)
-    print(f"\n完成！处理 {n_ok} 行，跳过 {n_skip} 行", flush=True)
-    print(f"输出: {out_path}", flush=True)
+    dbg(box, f"\n完成！处理 {processed} 行，跳过 {skipped} 行")
+    dbg(box, f"输出: {out_path}")
 
-# ---------- GUI ----------
+
+# ==================== GUI ====================
 def gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, scrolledtext
+
     root = tk.Tk()
-    root.title("报关自动化工具 v1.4")
-    root.geometry("720x580")
+    root.title("报关自动化工具 v1.6")
+    root.geometry("780x640")
     mv, fv = tk.StringVar(), tk.StringVar()
 
     tk.Label(root, text="① 选总表：").grid(row=0, column=0, sticky="e", padx=8, pady=12)
     tk.Entry(root, textvariable=mv, width=58).grid(row=0, column=1, padx=4)
-    tk.Button(root, text="浏览…", command=lambda: mv.set(filedialog.askopenfilename(
-        filetypes=[("Excel","*.xlsx *.xlsm *.xls")]) or mv.get())).grid(row=0, column=2, padx=6)
+    tk.Button(root, text="浏览…", command=lambda: mv.set(
+        filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xlsm *.xls")]) or mv.get())
+    ).grid(row=0, column=2, padx=6)
 
     tk.Label(root, text="② 选合同文件夹：").grid(row=1, column=0, sticky="e", padx=8)
     tk.Entry(root, textvariable=fv, width=58).grid(row=1, column=1, padx=4)
-    tk.Button(root, text="浏览…", command=lambda: fv.set(filedialog.askdirectory() or fv.get())).grid(row=1, column=2, padx=6)
+    tk.Button(root, text="浏览…", command=lambda: fv.set(
+        filedialog.askdirectory() or fv.get())).grid(row=1, column=2, padx=6)
 
-    box = scrolledtext.ScrolledText(root, height=26, font=("Consolas", 9))
+    box = scrolledtext.ScrolledText(root, height=28, font=("Consolas", 9))
     box.grid(row=3, column=0, columnspan=3, padx=12, pady=10, sticky="nsew")
 
     def run():
         if not mv.get() or not fv.get():
-            return messagebox.showwarning("提示","先选总表，再选合同文件夹")
-        box.delete("1.0","end")
-        import io, contextlib
-        buf = io.StringIO()
+            return messagebox.showwarning("提示", "先选总表，再选合同文件夹")
+        box.delete("1.0", "end")
         try:
-            with contextlib.redirect_stdout(buf):
-                process(mv.get(), fv.get(), os.path.splitext(mv.get())[0]+"_已填写.xlsx", box)
-            box.insert("end", buf.getvalue())
-            messagebox.showinfo("完成","已生成 _已填写.xlsx")
+            process(mv.get(), fv.get(), os.path.splitext(mv.get())[0] + "_已填写.xlsx", box)
+            messagebox.showinfo("完成", "已生成 _已填写.xlsx")
         except Exception:
             box.insert("end", traceback.format_exc())
-            messagebox.showerror("报错","看日志")
+            messagebox.showerror("报错", "请看日志")
 
     tk.Button(root, text="③ 开始处理", command=run, bg="#1f6feb", fg="white",
-              font=("Microsoft YaHei",10,"bold"), width=18).grid(row=2, column=1, pady=6)
-    root.grid_rowconfigure(3, weight=1); root.grid_columnconfigure(1, weight=1)
+              font=("Microsoft YaHei", 10, "bold"), width=18).grid(row=2, column=1, pady=6)
+    root.grid_rowconfigure(3, weight=1)
+    root.grid_columnconfigure(1, weight=1)
     root.mainloop()
+
 
 if __name__ == "__main__":
     if len(sys.argv) >= 3:
-        process(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv)>3 else "out.xlsx")
+        process(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "out.xlsx")
     else:
         gui()
