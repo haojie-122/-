@@ -29,8 +29,8 @@ jobs:
       - name: 发布到 Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.2
-          name: 报关自动化工具 v1.0.2（诊断版）
+          tag_name: v1.0.3  
+          name: 报关自动化工具 v1.0.3（表头修复）
           files: dist/报关自动化工具.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
