@@ -1,57 +1,75 @@
-# 报关自动化工具 v1.1 —— 诊断增强版
+# 报关自动化工具 v1.2 —— 修复表头 Cell 读取 bug
 import os, sys, glob, re, traceback
 import openpyxl
 from openpyxl import load_workbook
 
-DEBUG = True   # 打印诊断信息到日志框
+DEBUG = True
 
 def dbg(box, s):
     if DEBUG:
         print(s)
-        if box: box.insert("end", s + "\n"); box.see("end")
+        if box:
+            try:
+                box.insert("end", s + "\n"); box.see("end")
+            except Exception:
+                pass
 
 def num(x, default=0.0):
     if x is None: return default
-    s = str(x).strip().replace(",", "")
-    if not s: return default
-    try: return float(s)
+    if isinstance(x, str):
+        s = x.strip().replace(",", "")
+        if not s: return default
+        try: return float(s)
+        except: return default
+    try: return float(x)
     except: return default
 
 def txt(x):
-    return "" if x is None else str(x).strip()
+    if x is None: return ""
+    if hasattr(x, "value"):   # openpyxl Cell 对象
+        return txt(x.value)
+    return str(x).strip()
 
 def norm_unit(s):
     s = txt(s).lower()
-    s = (s.replace("sets","set").replace("set","set")
-          .replace("pieces","pc").replace("piece","pc").replace("pcs","pc")
-          .replace("kgs","kg").replace("cartons","ctn").replace("carton","ctn")
-          .replace("units","pc").replace("unit","pc"))
+    s = (s.replace("sets", "set").replace("set", "set")
+          .replace("pieces", "pc").replace("piece", "pc").replace("pcs", "pc")
+          .replace("kgs", "kg").replace("cartons", "ctn").replace("carton", "ctn")
+          .replace("units", "pc").replace("unit", "pc"))
     return s.strip()
 
 # ---------- 读合同 ----------
-def read_contract(path):
+def _head_and_rows(ws, box=None):
+    rows = list(ws.iter_rows(values_only=False))
+    # 找到表头行：含 AMOUNT / TOTAL / DESCRIPTION 之一
+    hi = 0
+    for i, row in enumerate(rows[:30]):
+        cells = [txt(c) for c in row]
+        if any("AMOUNT" in c.upper() or "TOTAL" in c.upper() or "DESCRIPTION" in c.upper() for c in cells if c):
+            hi = i; break
+    head = [txt(c).upper() for c in rows[hi]]
+    dbg(box, f"  合同表头行[{hi}] = {head}")
+    return head, rows, hi
+
+def read_contract(path, box=None):
     ext = path.lower()
-    # .xls 转成临时 .xlsx 再读，避免 openpyxl 读不了旧格式
     converted = None
     if ext.endswith(".xls"):
         try:
-            from win32com.client import Dispatch   # 需要本机装 pywin32；云端用下面兜底
-        except Exception:
-            Dispatch = None
-        if Dispatch is None:
-            # 云端/无Excel环境：用 xlrd 读
+            import xlrd
+            return _read_xls_xlrd(path, box)
+        except Exception as e:
+            dbg(box, f"  xlrd读xls失败，尝试转换: {e}")
+            # 尝试本机Excel转换
             try:
-                import xlrd
-                return _read_xls_xlrd(path)
-            except Exception:
-                pass
-        # 有Excel则转换
-        xl = Dispatch("Excel.Application"); xl.Visible = False
-        wb = xl.Workbooks.Open(os.path.abspath(path))
-        tmp = os.path.join(os.path.dirname(path), "_tmp_convert.xlsx")
-        wb.SaveAs(os.path.abspath(tmp), 51); wb.Close(); xl.Quit()
-        converted = tmp
-        path = tmp
+                from win32com.client import Dispatch
+                xl = Dispatch("Excel.Application"); xl.Visible = False
+                wb = xl.Workbooks.Open(os.path.abspath(path))
+                tmp = os.path.join(os.path.dirname(path), "_tmp_convert.xlsx")
+                wb.SaveAs(os.path.abspath(tmp), 51); wb.Close(); xl.Quit()
+                converted = tmp; path = tmp
+            except Exception as e2:
+                dbg(box, f"  无法读xls(需xlrd或本机Excel): {e2}")
 
     wb = load_workbook(path, data_only=True)
     ws = None
@@ -59,46 +77,45 @@ def read_contract(path):
         if "attach" in n.lower(): ws = wb[n]; break
     if ws is None:
         for n in wb.sheetnames:
-            if n.strip().upper() in ("CI","ATTACHMENT 1","ATTACHMENT","IV"):
+            if n.strip().upper() in ("CI", "ATTACHMENT 1", "ATTACHMENT", "IV"):
                 ws = wb[n]; break
-    if ws is None: ws = wb.active
+    if ws is None:
+        ws = wb.active
 
-    rows = list(ws.iter_rows(values_only=True))
-    info = dict(amount=None, bm=None, ppn_rate=11.0, ppn_amt=None,
-                qty=None, unit="", has_pph=False, has_bm=False)
+    head, rows, hi = _head_and_rows(ws, box)
 
-    hi = 0
-    for i, row in enumerate(rows[:25]):
-        if any("AMOUNT" in txt(c).upper() or "TOTAL" in txt(c).upper() for c in row if c is not None):
-            hi = i; break
-
-    head = [txt(c).upper() for c in rows[hi]]
     def col(*keys):
         for k in keys:
             for i, h in enumerate(head):
-                if k in h and "PRICE" not in h:
+                hu = h.upper().replace(" ", "")
+                ku = k.upper().replace(" ", "")
+                if ku in hu and "PRICE" not in hu:
                     return i
         return -1
 
-    i_amt  = col("AMOUNT","TOTAL","SUBTOTAL")
-    i_qty  = col("QTY","QUANTITY","PCS")
-    i_unit = col("UNIT","UOM")
-    i_bm   = col("BM","DUTY")
-    i_ppn  = col("PPN","VAT")
-    i_pph  = col("PPH","WITHHOLDING")
+    i_amt  = col("AMOUNT", "TOTAL", "SUBTOTAL")
+    i_qty  = col("QTY", "QUANTITY", "PCS")
+    i_unit = col("UNIT", "UOM")
+    i_bm   = col("BM", "DUTY")
+    i_ppn  = col("PPN", "VAT")
+    i_pph  = col("PPH", "WITHHOLDING")
 
-    for row in rows[hi+1:hi+150]:
-        a = num(row[i_amt]) if i_amt >= 0 else 0
+    info = dict(amount=None, bm=None, ppn_rate=11.0, ppn_amt=None,
+                qty=None, unit="", has_pph=False, has_bm=False)
+
+    for row in rows[hi+1:hi+200]:
+        vals = [c.value if hasattr(c, "value") else c for c in row]
+        a = num(vals[i_amt]) if i_amt >= 0 else 0
         if a: info["amount"] = max(info["amount"] or 0, a)
-        q = num(row[i_qty]) if i_qty >= 0 else 0
+        q = num(vals[i_qty]) if i_qty >= 0 else 0
         if q: info["qty"] = q
-        u = txt(row[i_unit]) if i_unit >= 0 else ""
+        u = txt(vals[i_unit]) if i_unit >= 0 else ""
         if u: info["unit"] = u
-        b = num(row[i_bm]) if i_bm >= 0 else 0
+        b = num(vals[i_bm]) if i_bm >= 0 else 0
         if b: info["bm"] = b; info["has_bm"] = True
-        p = num(row[i_ppn]) if i_ppn >= 0 else 0
+        p = num(vals[i_ppn]) if i_ppn >= 0 else 0
         if p: info["ppn_amt"] = p
-        w = num(row[i_pph]) if i_pph >= 0 else 0
+        w = num(vals[i_pph]) if i_pph >= 0 else 0
         if w: info["has_pph"] = True
 
     wb.close()
@@ -107,24 +124,29 @@ def read_contract(path):
         except Exception: pass
     return info
 
-def _read_xls_xlrd(path):
+def _read_xls_xlrd(path, box=None):
     import xlrd
     wb = xlrd.open_workbook(path)
     sh = wb.sheet_by_index(0)
-    # 简化：只取前150行，用于匹配金额
-    rows = [[sh.cell_value(r,c) for c in range(sh.ncols)] for r in range(min(sh.nrows,150))]
-    info = dict(amount=None, bm=None, ppn_rate=11.0, ppn_amt=None, qty=None, unit="", has_pph=False, has_bm=False)
+    raw = [[sh.cell_value(r, c) for c in range(sh.ncols)] for r in range(min(sh.nrows, 200))]
+    rows = [[v for v in row] for row in raw]
     hi = 0
-    for i,row in enumerate(rows[:25]):
-        if any("AMOUNT" in txt(c).upper() for c in row): hi=i; break
-    head=[txt(c).upper() for c in rows[hi]]
+    for i, row in enumerate(rows[:30]):
+        if any("AMOUNT" in txt(c).upper() for c in row): hi = i; break
+    head = [txt(c).upper() for c in rows[hi]]
+    dbg(box, f"  [xls] 表头行[{hi}] = {head}")
+
     def col(*keys):
         for k in keys:
-            for i,h in enumerate(head):
-                if k in h and "PRICE" not in h: return i
+            for i, h in enumerate(head):
+                hu = h.upper().replace(" ", "")
+                ku = k.upper().replace(" ", "")
+                if ku in hu and "PRICE" not in hu: return i
         return -1
+
     i_amt=col("AMOUNT","TOTAL"); i_bm=col("BM","DUTY"); i_ppn=col("PPN"); i_pph=col("PPH")
     i_qty=col("QTY"); i_unit=col("UNIT")
+    info = dict(amount=None, bm=None, ppn_rate=11.0, ppn_amt=None, qty=None, unit="", has_pph=False, has_bm=False)
     for row in rows[hi+1:]:
         a=num(row[i_amt]) if i_amt>=0 else 0
         if a: info["amount"]=max(info["amount"] or 0,a)
@@ -148,49 +170,53 @@ def find_contract(folder, inv_key, box=None):
     k = norm(inv_key)
     dbg(box, f"  [匹配] 发票号归一化 = '{k}'")
     if not k: return None
-    files = [p for p in glob.glob(os.path.join(folder,"*"))
-             if p.lower().endswith((".xls",".xlsx"))]
+    files = [p for p in glob.glob(os.path.join(folder, "*"))
+             if p.lower().endswith((".xls", ".xlsx"))]
     dbg(box, f"  [匹配] 文件夹内候选合同数 = {len(files)}")
-    # 1) 精确包含
+    cores = re.sub(r"[^0-9A-Z]", "", k)
     for p in files:
         n = norm(os.path.basename(p))
         if k in n or n in k:
-            dbg(box, f"  [匹配] 命中 -> {os.path.basename(p)}")
-            return p
-    # 2) 放宽：只要发票号的核心数字串在文件名里（如 20260813AU2）
-    core = re.sub(r"[^0-9A-Z]", "", k)
+            dbg(box, f"  [匹配] 精确命中 -> {os.path.basename(p)}"); return p
     for p in files:
         n = norm(os.path.basename(p))
-        if core and core in n:
-            dbg(box, f"  [匹配] 模糊命中 -> {os.path.basename(p)}")
-            return p
+        if cores and cores in n:
+            dbg(box, f"  [匹配] 模糊命中 -> {os.path.basename(p)}"); return p
     dbg(box, "  [匹配] 未找到任何匹配合同")
     return None
 
 # ---------- 主处理 ----------
 def process(master_path, folder, out_path, box=None):
-    wb = load_workbook(master_path)
+    wb = load_workbook(master_path, data_only=True)
     ws = wb.active
-    dbg(box, f"总表活动Sheet: {ws.title}, 最大行={ws.max_row}, 最大列={ws.max_column}")
+    dbg(box, f"\n==== 总表 ====")
+    dbg(box, f"Sheet: {ws.title}, 行={ws.max_row}, 列={ws.max_column}")
 
-    head = [txt(c) for c in ws[1]]
-    dbg(box, f"表头第1行: {head}")
+    # 关键修复：用 .value 取表头真实文本
+    head_cells = ws[1]
+    head = [txt(c) for c in head_cells]
+    dbg(box, f"表头(真实值): {head}")
+
     def C(*keys):
         for k in keys:
             for i, h in enumerate(head):
                 hu = h.upper().replace(" ", "")
-                if k.upper().replace(" ", "") in hu:
-                    dbg(box, f"  列匹配 '{k}' -> 第{i+1}列 (表头='{h}')")
+                ku = k.upper().replace(" ", "")
+                if ku in hu:
+                    dbg(box, f"  列匹配 '{k}' -> 第{i+1}列 ('{h}')")
                     return i + 1
-        dbg(box, f"  列匹配 '{keys}' -> 未找到")
+        dbg(box, f"  列匹配 {keys} -> 未找到")
         return None
 
-    c_inv  = C("IV&PL","INVOICE NO","发票号","INVOICE","合同号")
-    c_tax  = C("关税金额","关税")
-    c_tot  = C("总税额","总税")
+    c_inv  = C("IV&PL", "INVOICE NO", "发票号", "INVOICE", "合同号")
+    c_tax  = C("关税金额", "关税")
+    c_tot  = C("总税额", "总税")
     c_note = C("备注")
-    c_qty  = C("件数","数量","QTY")
-    c_unit = C("单位","UNIT")
+    c_qty  = C("件数", "数量", "QTY")
+    c_unit = C("单位", "UNIT")
+
+    if not c_inv:
+        print("⚠️ 未找到发票号列！请把总表第1行表头截图发我。", flush=True)
 
     n_ok = n_skip = 0
     for r in range(2, ws.max_row + 1):
@@ -203,7 +229,7 @@ def process(master_path, folder, out_path, box=None):
             if c_note: ws.cell(r, c_note).value = "未找到合同"
             n_skip += 1; continue
         try:
-            info = read_contract(cp)
+            info = read_contract(cp, box)
         except Exception as e:
             dbg(box, f"  读合同失败: {e}")
             if c_note: ws.cell(r, c_note).value = "合同读取失败"
@@ -229,16 +255,16 @@ def process(master_path, folder, out_path, box=None):
         dbg(box, f"  [OK] 关税={info['bm']} 总税额={(info['bm'] or 0)+(ppn or 0)} {note}")
 
     wb.save(out_path)
-    print(f"\n完成！处理 {n_ok} 行，跳过 {n_skip} 行")
-    print(f"输出: {out_path}")
+    print(f"\n完成！处理 {n_ok} 行，跳过 {n_skip} 行", flush=True)
+    print(f"输出: {out_path}", flush=True)
 
 # ---------- GUI ----------
 def gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, scrolledtext
     root = tk.Tk()
-    root.title("报关自动化工具 v1.1 (诊断版)")
-    root.geometry("680x520")
+    root.title("报关自动化工具 v1.2")
+    root.geometry("700x560")
     mv, fv = tk.StringVar(), tk.StringVar()
 
     tk.Label(root, text="① 选总表：").grid(row=0, column=0, sticky="e", padx=8, pady=12)
@@ -250,7 +276,7 @@ def gui():
     tk.Entry(root, textvariable=fv, width=58).grid(row=1, column=1, padx=4)
     tk.Button(root, text="浏览…", command=lambda: fv.set(filedialog.askdirectory() or fv.get())).grid(row=1, column=2, padx=6)
 
-    box = scrolledtext.ScrolledText(root, height=22, font=("Consolas", 9))
+    box = scrolledtext.ScrolledText(root, height=24, font=("Consolas", 9))
     box.grid(row=3, column=0, columnspan=3, padx=12, pady=10, sticky="nsew")
 
     def run():
