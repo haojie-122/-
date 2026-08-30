@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-报关自动化工具 v2.5（终版 - 逐行公式 / PPH不参与 / 增值税由总表公式算）
-==================================================================
+报关自动化工具 v2.6（终版 - 标准四舍五入 / PPH不参与 / 增值税总表公式算）
+==========================================================================
 每行公式（用户确认，不可再改）：
     BM税额  = AMOUNT × BM%
     PPN税额 = (AMOUNT + BM税额) × PPN%
@@ -10,13 +10,12 @@
 汇总（所有商品行求和后再填表）：
     关税金额 = Σ(BM税额)
     总税额   = Σ(该行总税)               ← 不含 PPH
-    增值税金额 = 代码不填，总表用公式 =(发票金额列 + 关税列) × 0.11
+    增值税金额 = 代码不填，总表用公式 =ROUND((发票金额列 + 关税列) * 0.11, 2)
 
-说明：
-    1) PPH 全程不参与任何输出列（不读、不加、不减）
-    2) 增值税列代码不动，依赖总表单元格公式自动计算
-    3) 输出文件名带时间戳，避免 Excel 占用导致 PermissionError
-==================================================================
+四舍五入：
+    所有写入总表的数值使用 round2()（Decimal ROUND_HALF_UP），
+    保证第 3 位小数 5 时正确进位（如 2722.995 → 2723.00，而非 2722.99）
+==========================================================================
 """
 import os
 import re
@@ -24,6 +23,7 @@ import sys
 import glob
 import traceback
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 
 import openpyxl
 from openpyxl import load_workbook
@@ -49,6 +49,20 @@ def dbg(box, s):
             box.see("end")
         except Exception:
             pass
+
+
+def round2(x):
+    """标准四舍五入到 2 位小数（第 3 位进位），返回 float。
+    解决 Python 内置 round() 的银行家舍入及浮点精度问题
+    （如 round(2722.995, 2) 会得到 2722.99 的 bug）。
+    """
+    if x is None:
+        return 0.0
+    try:
+        # 先转字符串，避免 float 二进制表示误差（str(2722.995) == '2722.995'）
+        return float(Decimal(str(x)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+    except Exception:
+        return round(float(x), 2)
 
 
 def cell_text(v):
@@ -224,7 +238,7 @@ def read_contract(path, box=None):
         每行 BM  = AMOUNT × BM%
         每行 PPN = (AMOUNT + BM) × PPN%
         每行总税 = BM + PPN            ← 不含 PPH
-        汇总 = 所有商品行求和
+        汇总 = 所有商品行求和，再用 round2 标准四舍五入
     """
     dbg(box, f"\n  读取合同: {os.path.basename(path)}")
     try:
@@ -259,10 +273,10 @@ def read_contract(path, box=None):
         grand = get_amount_fallback(rows)
     dbg(box, f"  合计行=第{grand_row}行  GRAND_AMOUNT={grand}")
 
-    # ===== v2.5 修正：严格按用户公式，PPH 完全不参与 =====
+    # ===== v2.6 修正：严格按用户公式，PPH 完全不参与 =====
     #   每行: BM = H×M
     #         总税行 = H×M + (H + H×M) × O     ← O=PPN，不含 PPH
-    #   全部行算完再求和
+    #   全部行算完再求和，最后统一标准四舍五入
     sum_bm  = 0.0
     sum_tax = 0.0
     data_rows = range(hr + 1, len(rows) + 1)
@@ -296,10 +310,10 @@ def read_contract(path, box=None):
 
     info = {
         "amount": grand,
-        "bm":  round(sum_bm, 2),
-        "ppn": round(sum_tax - sum_bm, 2),      # 增值税 = 总税 − 关税（仅日志参考，不写入）
+        "bm":  round2(sum_bm),
+        "ppn": round2(sum_tax - sum_bm),      # 增值税 = 总税 − 关税（仅日志参考，不写入）
         "pph": 0.0,
-        "total_ex_pph": round(total_ex_pph, 2),
+        "total_ex_pph": round2(total_ex_pph),
     }
     dbg(box, f"  → BM税额={info['bm']}  PPN税额={info['ppn']}  PPH=不进表")
     dbg(box, f"  → 总税(逐行 H×M+(H+H×M)×O, 不含PPH)={info['total_ex_pph']}")
@@ -401,16 +415,16 @@ def process(master_path, folder, box=None):
             skipped += 1
             continue
 
-        # ① 关税金额 = Σ(H×M)        ← 代码填
+        # ① 关税金额 = Σ(H×M)        ← 代码填（已标准四舍五入）
         if duty_col:
             ws.cell(r, duty_col).value = info["bm"]
 
-        # ③ 总税额 = Σ(H×M + (H+H×M)×O)，不含 PPH   ← 代码填
+        # ③ 总税额 = Σ(H×M + (H+H×M)×O)，不含 PPH   ← 代码填（已标准四舍五入）
         if tax_col:
             ws.cell(r, tax_col).value = info["total_ex_pph"]
 
         # ② 增值税金额：代码不填！
-        #    总表该列公式 =(发票金额列 + 关税列) * 0.11，Excel 自动算
+        #    总表该列公式 =ROUND((发票金额列 + 关税列) * 0.11, 2)，Excel 自动算并四舍五入
         #    若该列是残留旧数值（非公式），清空让公式接管：
         if vat_col:
             v = ws.cell(r, vat_col).value
@@ -436,7 +450,7 @@ def gui():
     from tkinter import filedialog, messagebox, scrolledtext
 
     root = tk.Tk()
-    root.title("报关自动化工具 v2.5（逐行公式 / PPH不参与）")
+    root.title("报关自动化工具 v2.6（标准四舍五入 / PPH不参与）")
     root.geometry("840x700")
     mv, fv = tk.StringVar(), tk.StringVar()
 
