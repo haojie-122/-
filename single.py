@@ -1,322 +1,382 @@
-# -*- coding: utf-8 -*-
-"""
-报关自动化工具 v3.3 终版
-=========================
-计税口径（用户逐条确认，不可再改）：
-  每行 关税(BM可免) = H × M                        H=AMOUNT, M=BM税率
-  每行 总税         = H×M + (H + H×M) × O          O=PPN税率，不含 PPH
-  代码只填 2 列：关税金额、总税额（逐行求和后再填）
-  增值税金额 由总表公式 =(发票金额 + 关税金额) × 0.11 自动算，代码不填
-  PPH 全程不参与任何一列
-
-作者：自用工具
-"""
 import os
-import re
 import sys
-import time
+import re
+import glob
 import traceback
 from datetime import datetime
 
-import openpyxl
-from openpyxl import load_workbook
-from openpyxl.styles import Font, Alignment, PatternFill
 import tkinter as tk
-from tkinter import filedialog, messagebox
-import threading
+from tkinter import ttk, filedialog, messagebox
 
-# ============================ 配置区 ============================
-CONTRACT_DIR = r"C:\Users\31966\Desktop\报关自动化工具\合同"   # 合同文件夹，按需改
-OUTPUT_DIR   = r"C:\Users\31966\Desktop\报关自动化工具\输出"     # 输出目录，按需改
-
-# 总表目标列（按表头文字匹配，不区分大小写/空格/换行）
-COL_DUTY = "关税金额"     # 代码写入
-COL_TAX  = "总税额"       # 代码写入
-COL_VAT  = "增值税金额"   # 代码不写，总表自带公式 =(H+关税)*0.11
-COL_AMT  = "发票金额"     # 若总表该列为空，代码顺手填 AMOUNT 合计；已有则跳过
-
-# 总表定位
-MASTER_SHEET = "Sheet2"      # 总表工作表名
-HEADER_ROW   = 2             # 表头在第 2 行
-FIRST_DATA_ROW = 3           # 数据从第 3 行开始
-
-# 合同表定位
-CONTRACT_HEADER_ROW = 6      # 合同税率表头在第 6 行（按日志）
-CONTRACT_AMOUNT_COL = "AMOUNT"   # 合同里 H 列
-CONTRACT_BM_COL      = "BM"       # 合同里 M 列
-CONTRACT_PPN_COL     = "PPN"      # 合同里 O 列
-# 注：合同里的 PPH 列即使存在，也完全不读取、不参与计算
-
-VAT_RATE = 0.11   # 总表增值税公式固定税率，若合同有差异改这里
-
-LOG_BOX = None
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 
-def log(msg):
+# ===================== 路径配置 =====================
+BASE_DIR = r"C:\Users\31966\Desktop\报关自动化工具"
+CONTRACT_DIR = os.path.join(BASE_DIR, "合同")
+OUTPUT_DIR = os.path.join(BASE_DIR, "输出")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# 合同表头行（你这个例子是第6行）
+CONTRACT_HEADER_ROW = 6
+
+# 总表表头行，按你实际；如果不是第2行改这里
+MASTER_HEADER_ROW = 2
+
+# 关键字匹配
+INVOICE_COL_KEYWORDS = ["发票号", "invoice", "inv"]
+AMOUNT_COL_KEYWORDS = ["发票金额", "金额", "amount", "cif", "grand total cif"]
+DUTY_COL_KEYWORDS = ["关税金额", "关税", "bm金额", "bm可免合计", "关税(bm)"]
+TAX_COL_KEYWORDS = ["总税额", "税额合计", "总税", "合计税额"]
+VAT_COL_KEYWORDS = ["增值税金额", "增值税", "vat", "ppn金额"]
+
+
+def log(msg, log_widget=None):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line)
-    if LOG_BOX:
-        try:
-            LOG_BOX.configure(state="normal")
-            LOG_BOX.insert("end", line + "\n")
-            LOG_BOX.see("end")
-            LOG_BOX.configure(state="disabled")
-        except Exception:
-            pass
+    if log_widget is not None:
+        log_widget.insert(tk.END, line + "\n")
+        log_widget.see(tk.END)
+        log_widget.update_idletasks()
 
 
-def norm(s):
-    """表头归一化：去空格/换行/全角，转小写"""
-    return re.sub(r"[\s\u3000\n\r\t]+", "", str(s or "")).lower()
+def normalize_header(x):
+    if x is None:
+        return ""
+    return re.sub(r"\s+", "", str(x)).replace("\n", "").replace("\r", "").replace("\\n", "").lower()
 
 
-def to_num(v):
-    """安全转数字"""
-    if v is None:
+def to_num(x):
+    if x is None or x == "":
         return 0.0
-    if isinstance(v, (int, float)):
-        return float(v)
-    t = str(v).strip().replace(",", "").replace("$", "").replace("¥", "").replace("%", "")
-    if t in ("", "-", "--", "None", "nan", "N/A"):
-        return 0.0
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip().replace(",", "").replace("$", "").replace("¥", "").replace("￥", "")
+    s = s.replace("USD", "").replace("CNY", "").replace("RMB", "")
     try:
-        return float(t)
-    except Exception:
+        return float(s)
+    except:
         return 0.0
 
 
-# ============================ 读合同 ============================
-def read_contract(path):
+def percent_to_rate(x):
+    v = to_num(x)
+    s = str(x).strip() if x is not None else ""
+    if "%" in s:
+        return v / 100.0
+    if v > 1:
+        return v / 100.0
+    return v
+
+
+def find_file_by_invoice(contract_dir, invoice_no):
+    if not invoice_no:
+        return None
+    key = str(invoice_no).strip()
+    patterns = [
+        f"*{key}*.xls",
+        f"*{key}*.xlsx",
+    ]
+    found = []
+    for root, dirs, files in os.walk(contract_dir):
+        for name in files:
+            if name.startswith("~$"):
+                continue
+            low = name.lower()
+            if low.endswith((".xls", ".xlsx")):
+                if key.lower() in name.lower():
+                    found.append(os.path.join(root, name))
+    # 优先精确一点：含 iv / invoice 的优先，但不强求
+    found.sort(key=lambda p: ("iv" in os.path.basename(p).lower(), p), reverse=True)
+    return found[0] if found else None
+
+
+def read_contract_amount_and_tax(contract_path):
     """
-    返回 dict:
-      bm   = Σ(H×M)                      关税金额
-      tax  = Σ(H×M + (H+H×M)×O)          总税额（不含 PPH）
-      rows = 商品行数
+    返回:
+    bm_sum, tax_sum, grand_amount, rows_count
+    公式：
+    每行:
+        bm_row = H_amount * M_bm_rate
+        tax_row = bm_row + (H_amount + bm_row) * O_ppn_rate
+    合计:
+        bm_sum = sum(bm_row)
+        tax_sum = sum(tax_row)
+    不含 PPH。
     """
-    wb = load_workbook(path, data_only=True, read_only=True)
-    ws = wb.worksheets[0]
-    rows = ws.iter_rows(values_only=True)
-    rows = [r for r in rows]
+    wb = load_workbook(contract_path, data_only=True, read_only=True, keep_vba=False)
+    ws = wb.active
 
-    # 找表头行
-    hr = CONTRACT_HEADER_ROW - 1
-    header = rows[hr] if len(rows) > hr else []
-    idx = {}
-    for i, cell in enumerate(header):
-        k = norm(cell)
-        if not k:
-            continue
-        if "amount" in k or k in ("amt", "金额"):
-            idx.setdefault("AMOUNT", i)
-        elif k == "bm" or k.endswith("可免") or "bm可免" in k:
-            idx.setdefault("BM", i)
-        elif k == "ppn" or "ppn" in k:
-            idx.setdefault("PPN", i)
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
 
-    if "AMOUNT" not in idx:
-        wb.close()
-        raise ValueError(f"合同表头找不到 AMOUNT 列：{os.path.basename(path)}")
+    if len(rows) < CONTRACT_HEADER_ROW:
+        raise ValueError(f"合同行数不足，表头行={CONTRACT_HEADER_ROW}，文件={os.path.basename(contract_path)}")
 
-    c_h = idx["AMOUNT"]
-    c_m = idx.get("BM", -1)
-    c_o = idx.get("PPN", -1)
+    header = rows[CONTRACT_HEADER_ROW - 1]
+    head = [normalize_header(x) for x in header]
 
-    # 找合计行（含 GRAND / TOTAL 字样的行，跳过）
-    grand = None
-    for i in range(hr + 1, len(rows)):
-        first = str(rows[i][0] or "") if rows[i] else ""
-        if re.search(r"grand|total|合计|总计", first, re.I):
-            grand = i
-            break
+    # 你给的表头顺序参考:
+    # NO, DESCRIPTION, BRAND, MODEL, QUANTITY, '', UNIT PRICE, AMOUNT,
+    # '', 中文品名, HS CODE(CHINA), HS CODE(INDONESIA), BM, BM可免, PPN, PPH, 合计税率, 税额, 监管条件, ''
+    # 索引: AMOUNT=7, BM=12, BM可免=13, PPN=14, PPH=15, 税额=17
+    # 但用关键字找更稳。
+    def idx(keywords):
+        for k in keywords:
+            kk = normalize_header(k)
+            for i, h in enumerate(head):
+                if kk and h and kk in h:
+                    return i
+        return None
+
+    i_amount = idx(["AMOUNT", "金额", "UNIT PRICE"] + AMOUNT_COL_KEYWORDS)
+    i_bm = idx(["BM", "关税", "BM税率"] + DUTY_COL_KEYWORDS)
+    i_ppn = idx(["PPN", "增值税", "PPN税率"] + VAT_COL_KEYWORDS)
+    i_pph = idx(["PPH"])
+    i_grand_text = idx(["GRAND TOTAL CIF", "GRAND TOTAL", "TOTAL CIF", "总金额"])
+
+    # 兜底：按你截图固定列
+    if i_amount is None:
+        i_amount = 7
+    if i_bm is None:
+        i_bm = 12
+    if i_ppn is None:
+        i_ppn = 14
+    if i_pph is None:
+        i_pph = 15
 
     sum_bm = 0.0
     sum_tax = 0.0
-    cnt = 0
+    grand_amount = None
 
-    for r in range(hr + 1, len(rows)):
-        if grand is not None and r == grand:
+    data_start = CONTRACT_HEADER_ROW
+    data_end = len(rows)
+
+    # 找合计行：包含 GRAND TOTAL CIF 或 AMOUNT列附近有合计
+    grand_row_idx = None
+    for r_idx in range(data_start, len(rows)):
+        row = rows[r_idx]
+        if not row:
             continue
-        row = rows[r]
-        if not row or all(v is None or str(v).strip() == "" for v in row):
+        txt = " ".join(str(x) for x in row if x is not None)
+        if "GRAND TOTAL" in txt.upper() or "TOTAL CIF" in txt.upper():
+            grand_row_idx = r_idx
+            if i_amount is not None and row[i_amount] is not None:
+                grand_amount = abs(to_num(row[i_amount]))
+            break
+
+    end_scan = grand_row_idx if grand_row_idx is not None else len(rows)
+
+    item_rows = 0
+    for r_idx in range(data_start, end_scan):
+        row = rows[r_idx]
+        if not row or len(row) == 0:
             continue
 
-        h = to_num(row[c_h] if c_h < len(row) else None)
+        # 跳过合计/空行
+        txt = " ".join(str(x) for x in row if x is not None).upper()
+        if "GRAND TOTAL" in txt or "TOTAL CIF" in txt:
+            continue
+
+        h = to_num(row[i_amount]) if i_amount is not None and i_amount < len(row) else 0.0
         if h <= 0:
             continue
-        m = to_num(row[c_m]) if c_m >= 0 and c_m < len(row) else 0.0
-        o = to_num(row[c_o]) if c_o >= 0 and c_o < len(row) else 0.0
 
-        bm_row = h * m                                  # H×M
-        tax_row = bm_row + (h + bm_row) * o             # H×M + (H+H×M)×O  ← 不含 PPH
+        m = percent_to_rate(row[i_bm]) if i_bm is not None and i_bm < len(row) else 0.0
+        o = percent_to_rate(row[i_ppn]) if i_ppn is not None and i_ppn < len(row) else 0.0
+        # pph 不用于计算
+        _pph = percent_to_rate(row[i_pph]) if i_pph is not None and i_pph < len(row) else 0.0
+
+        bm_row = h * m
+        tax_row = bm_row + (h + bm_row) * o
 
         sum_bm += bm_row
         sum_tax += tax_row
-        cnt += 1
+        item_rows += 1
 
-    wb.close()
+    if grand_amount is None:
+        # 没找到合计行就从商品金额求和，或最后一行amount尝试
+        last = rows[-1]
+        if i_amount is not None and i_amount < len(last):
+            grand_amount = abs(to_num(last[i_amount]))
+        if grand_amount is None or grand_amount == 0:
+            grand_amount = sum(to_num(rows[r][i_amount]) for r in range(data_start, end_scan)
+                               if i_amount is not None and i_amount < len(rows[r]))
 
-    return {
-        "bm": round(sum_bm, 2),
-        "tax": round(sum_tax, 2),
-        "rows": cnt,
-        "file": os.path.basename(path),
-    }
+    return round(sum_bm, 2), round(sum_tax, 2), grand_amount, item_rows
 
 
-# ============================ 主流程 ============================
-def run(master_path):
-    log("=" * 58)
-    log(f"开始处理 → {os.path.basename(master_path)}")
+def find_master_columns(ws):
+    """
+    返回列号（1-based）
+    """
+    header_row = MASTER_HEADER_ROW
+    row = list(ws.iter_rows(min_row=header_row, max_row=header_row, values_only=True))[0]
 
-    if not os.path.isdir(CONTRACT_DIR):
-        raise RuntimeError(f"合同文件夹不存在：{CONTRACT_DIR}")
-    if not os.path.isdir(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
+    head = [normalize_header(x) for x in row]
 
-    # 1) 扫描合同（只吃 xls/xlsx，跳过损坏文件）
-    contracts = []
-    for fn in sorted(os.listdir(CONTRACT_DIR)):
-        if not fn.lower().endswith((".xlsx", ".xls")):
-            continue
-        contracts.append(os.path.join(CONTRACT_DIR, fn))
-    log(f"合同文件夹内有效文件 = {len(contracts)} 个")
+    def find(keywords):
+        for k in keywords:
+            kk = normalize_header(k)
+            for i, h in enumerate(head):
+                if kk and h and kk in h:
+                    return i + 1
+        return None
 
-    # 2) 打开总表
-    wb = load_workbook(master_path, data_only=False)
-    if MASTER_SHEET not in wb.sheetnames:
-        raise RuntimeError(f"总表找不到工作表「{MASTER_SHEET}」，现有：{wb.sheetnames}")
-    ws = wb[MASTER_SHEET]
+    col_inv = find(INVOICE_COL_KEYWORDS + ["发票号码"])
+    col_amount = find(AMOUNT_COL_KEYWORDS + ["发票金额", "cif金额"])
+    col_duty = find(DUTY_COL_KEYWORDS)
+    col_tax = find(TAX_COL_KEYWORDS)
+    col_vat = find(VAT_COL_KEYWORDS)
 
-    # 定位目标列
-    hdr = {}
-    for c in range(1, ws.max_column + 1):
-        v = ws.cell(HEADER_ROW, c).value
-        hdr[norm(v)] = c
-    log(f"总表表头(第{HEADER_ROW}行)列映射完成")
+    # 兜底：如果表头识别不到，按常见位置；你截图逻辑是 H发票金额, I关税, J增值税, K总税
+    if col_amount is None:
+        col_amount = 8
+    if col_duty is None:
+        col_duty = 9
+    if col_vat is None:
+        col_vat = 10
+    if col_tax is None:
+        col_tax = 11
 
-    col_duty = hdr.get(norm(COL_DUTY))
-    col_tax  = hdr.get(norm(COL_TAX))
-    col_vat  = hdr.get(norm(COL_VAT))
-    col_amt  = hdr.get(norm(COL_AMT))
+    return col_inv, col_amount, col_duty, col_vat, col_tax
 
-    if not col_duty:
-        raise RuntimeError(f"总表第{HEADER_ROW}行找不到表头「{COL_DUTY}」")
-    if not col_tax:
-        raise RuntimeError(f"总表第{HEADER_ROW}行找不到表头「{COL_TAX}」")
-    log(f"写入列 → 关税=第{col_duty}列  总税=第{col_tax}列  增值税=第{col_vat}列(仅公式,不写值)")
 
-    # 3) 发票号列：自动找含 发票/INVOICE/invoice 的表头
-    inv_col = None
-    for k, c in hdr.items():
-        if "发票" in k or "invoice" in k or "inv" == k:
-            inv_col = c
-            break
-    if not inv_col:
-        # 兜底：第 A 列
-        inv_col = 1
-        log("⚠ 未识别到发票号表头，默认取第 1 列作为发票号列")
-    else:
-        log(f"发票号列 = 第{inv_col}列")
+def run_master(master_path, contract_dir, log_widget=None):
+    log(f"开始处理 → {os.path.basename(master_path)}", log_widget)
+    log(f"合同目录 → {contract_dir}", log_widget)
 
-    # 4) 逐行匹配
-    hit = miss = 0
-    stamp = datetime.now().strftime("%m%d_%H%M%S")
+    if not os.path.isdir(contract_dir):
+        raise FileNotFoundError(f"合同目录不存在: {contract_dir}")
 
-    for r in range(FIRST_DATA_ROW, ws.max_row + 1):
-        inv = ws.cell(r, inv_col).value
+    files = [f for f in os.listdir(contract_dir) if f.lower().endswith((".xls", ".xlsx")) and not f.startswith("~$")]
+    log(f"合同目录内有效文件 = {len(files)} 个", log_widget)
+
+    wb = load_workbook(master_path)
+    ws = wb.active
+
+    col_inv, col_amount, col_duty, col_vat, col_tax = find_master_columns(ws)
+    log(f"写入列 → 发票金额=H/{col_amount}, 关税=I/{col_duty}, 增值税=J/{col_vat}(不写值,总表公式自算), 总税=K/{col_tax}", log_widget)
+    log(f"发票号列 = {get_column_letter(col_inv) if col_inv else '未识别'}", log_widget)
+
+    hit = 0
+    miss = 0
+    miss_list = []
+
+    # 从数据行开始，假设第3行起是数据；也可以扫描到最大行
+    start_row = MASTER_HEADER_ROW + 1
+    max_row = ws.max_row
+
+    for r in range(start_row, max_row + 1):
+        inv = ws.cell(r, col_inv).value if col_inv else None
         if inv is None or str(inv).strip() == "":
             continue
-        inv_s = str(inv).strip()
+        inv = str(inv).strip()
 
-        # 合同名里含发票号即命中（如 975_IWIP20260813KZH_iv.xls）
-        matched = None
-        for cp in contracts:
-            if inv_s.upper() in os.path.basename(cp).upper():
-                matched = cp
-                break
-
-        if not matched:
+        contract_path = find_file_by_invoice(contract_dir, inv)
+        if not contract_path:
+            log(f"   第{r}行 {inv} → ❌ 未找到合同", log_widget)
             miss += 1
-            log(f"  第{r}行 发票号={inv_s} → ❌ 未找到合同")
+            miss_list.append(inv)
             continue
 
         try:
-            info = read_contract(matched)
+            bm, tax, grand_amount, item_rows = read_contract_amount_and_tax(contract_path)
         except Exception as e:
+            log(f"   第{r}行 {inv} → 读取合同失败: {e}", log_widget)
             miss += 1
-            log(f"  第{r}行 发票号={inv_s} → ⚠ 读合同失败：{e}")
+            miss_list.append(inv)
             continue
 
-        # ★ 只写两列：关税、总税
-        ws.cell(r, col_duty).value = info["bm"]
-        ws.cell(r, col_tax).value  = info["tax"]
-        if col_amt:
-            # 发票金额列若为空，补 AMOUNT 合计（仅兜底，已有值不动）
-            if ws.cell(r, col_amt).value in (None, ""):
-                ws.cell(r, col_amt).value = round(info["bm"] + (info["tax"] - info["bm"]), 2)
+        ws.cell(r, col_duty).value = bm
+        ws.cell(r, col_tax).value = tax
 
+        # 增值税列：不写值，保留/由总表公式 =(发票金额列+关税列)*0.11 计算
+        # 如果原单元格不是公式且你希望清掉，可取消下一行注释：
+        # if ws.cell(r, col_vat).value is not None and not str(ws.cell(r, col_vat).value).startswith("="):
+        #     ws.cell(r, col_vat).value = None
+
+        log(f"   第{r}行 {inv} → ✅ 命中 {os.path.basename(contract_path)} | 商品行={item_rows} | 关税={bm:.2f} | 总税={tax:.2f}", log_widget)
         hit += 1
-        log(f"  第{r}行 {inv_s} → ✅ 命中 {info['file']} | 商品{info['rows']}行 | "
-            f"关税={info['bm']:,.2f} | 总税={info['tax']:,.2f}")
 
-    # 5) 保存（时间戳命名，避开 Excel 占用导致的 PermissionError）
-    out_name = f"总表_已填写_{stamp}.xlsx"
-    out_path = os.path.join(OUTPUT_DIR, out_name)
+    ts = datetime.now().strftime("%m%d_%H%M%S")
+    out_path = os.path.join(OUTPUT_DIR, f"总表_已填写_{ts}.xlsx")
     wb.save(out_path)
-    wb.close()
 
-    log("-" * 58)
-    log(f"✅ 完成：命中 {hit} 行，未匹配 {miss} 行")
-    log(f"✅ 输出文件 → {out_path}")
-    log(f"⚠ 提示：增值税列请确认总表已设公式 =(发票金额列 + 关税列) * {VAT_RATE}")
-    log("=" * 58)
+    log(f"------------------------------------------------------------", log_widget)
+    log(f"✅ 完成：命中 {hit} 行，未匹配 {miss} 行", log_widget)
+    log(f"✅ 输出文件 → {out_path}", log_widget)
+    if miss_list:
+        miss_txt = os.path.join(OUTPUT_DIR, f"未匹配发票号_{ts}.txt")
+        with open(miss_txt, "w", encoding="utf-8") as f:
+            f.write("\n".join(miss_list))
+        log(f"⚠ 未匹配清单 → {miss_txt}", log_widget)
+    log(f"⚠ 提示：增值税列请保持总表公式 = (发票金额列 + 关税列) * 0.11", log_widget)
+
     return out_path
 
 
-# ============================ GUI ============================
+# ===================== GUI =====================
 class App:
     def __init__(self, root):
-        global LOG_BOX
         self.root = root
         root.title("报关自动化工具 v3.3")
         root.geometry("900x560")
 
-        tk.Label(root, text="报关自动化 · 关税/总税自动填写", font=("Microsoft YaHei", 13, "bold")).pack(pady=8)
+        self.master_var = tk.StringVar()
+        self.contract_var = tk.StringVar(value=CONTRACT_DIR)
 
-        frm = tk.Frame(root)
-        frm.pack(fill="x", padx=12)
-        self.path_var = tk.StringVar(value="（选总表 xlsx）")
-        tk.Entry(frm, textvariable=self.path_var, width=80, font=("Microsoft YaHei", 9)).pack(side="left", padx=(0, 8))
-        tk.Button(frm, text="选择总表", command=self.pick).pack(side="left")
-        tk.Button(frm, text="▶ 开始运行", command=self.start, bg="#1677ff", fg="white",
-                  font=("Microsoft YaHei", 9, "bold")).pack(side="left", padx=8)
+        frm = ttk.Frame(root, padding=10)
+        frm.pack(fill=tk.X)
 
-        tk.Label(root, text="运行日志：", font=("Microsoft YaHei", 9), anchor="w").pack(fill="x", padx=14, pady=(10, 0))
+        ttk.Label(frm, text="总表 xlsx:").pack(side=tk.LEFT)
+        ttk.Entry(frm, textvariable=self.master_var, width=60).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frm, text="选择总表", command=self.choose_master).pack(side=tk.LEFT, padx=2)
+        ttk.Button(frm, text="开始运行", command=self.run).pack(side=tk.LEFT, padx=5)
 
-        LOG_BOX = tk.Text(root, state="disabled", font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
-        LOG_BOX.pack(fill="both", expand=True, padx=12, pady=(4, 12))
+        frm2 = ttk.Frame(root, padding=(10, 0))
+        frm2.pack(fill=tk.X)
+        ttk.Label(frm2, text="合同目录:").pack(side=tk.LEFT)
+        ttk.Entry(frm2, textvariable=self.contract_var, width=60).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frm2, text="选择合同目录", command=self.choose_contract_dir).pack(side=tk.LEFT, padx=2)
 
-        self.master = None
+        ttk.Label(root, text="运行日志:", padding=(10, 8, 0, 0)).pack(anchor=tk.W)
+        self.log = tk.Text(root, bg="#1e1e1e", fg="#dcdcdc", font=("Consolas", 10))
+        self.log.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-    def pick(self):
-        p = filedialog.askopenfilename(title="选总表", filetypes=[("Excel", "*.xlsx"), ("All", "*.*")])
+    def choose_master(self):
+        p = filedialog.askopenfilename(title="选择总表 xlsx", filetypes=[("Excel", "*.xlsx"), ("All", "*.*")])
         if p:
-            self.path_var.set(p)
-            self.master = p
+            self.master_var.set(p)
 
-    def start(self):
-        if not self.master:
-            messagebox.showwarning("提示", "请先选择总表文件")
+    def choose_contract_dir(self):
+        d = filedialog.askdirectory(title="选择合同目录", initialdir=self.contract_var.get() or BASE_DIR)
+        if d:
+            self.contract_var.set(d)
+
+    def run(self):
+        p = self.master_var.get().strip()
+        cdir = self.contract_var.get().strip()
+        if not p or not os.path.isfile(p):
+            messagebox.showwarning("提示", "请先选择总表 xlsx")
             return
-        threading.Thread(target=self._run, args=(self.master,), daemon=True).start()
+        if not cdir or not os.path.isdir(cdir):
+            messagebox.showwarning("提示", "请选择有效合同目录")
+            return
 
-    def _run(self, p):
+        self.log.delete("1.0", tk.END)
+        t = tk.Thread(target=self._run, args=(p, cdir), daemon=True)
+        t.start()
+
+    def _run(self, p, cdir):
         try:
-            out = run(p)
+            out = run_master(p, cdir, self.log)
             messagebox.showinfo("完成", f"处理完成！\n\n{out}")
         except Exception as e:
-            log(traceback.format_exc())
+            log(traceback.format_exc(), self.log)
             messagebox.showerror("出错", f"{type(e).__name__}：{e}")
 
 
@@ -328,8 +388,10 @@ def main():
 
 
 if __name__ == "__main__":
-    # 命令行模式：拖一个总表路径进来也能跑
     if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
-        run(sys.argv[1])
+        # 命令行：python xxx.py 总表.xlsx
+        # 合同目录仍用 GUI/默认 CONTRACT_DIR，或环境变量 CONTRACT_DIR
+        cdir = os.environ.get("CONTRACT_DIR", CONTRACT_DIR)
+        run_master(sys.argv[1], cdir)
     else:
         main()
