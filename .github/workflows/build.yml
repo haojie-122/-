@@ -29,8 +29,8 @@ jobs:
       - name: 发布到 Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.12
-          name: 报关自动化工具 v1.0.12（复合税公式终版）
+          tag_name: v1.0.18 
+          name: 报关自动化工具 v1.0.18（改换公式版）
           files: dist/报关自动化工具.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
