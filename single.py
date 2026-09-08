@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-报关自动化工具 v2.10（B方案：总税读合同"税额"列 / BM逐行round2 / 发票金额核对）
+报关自动化工具 v2.11（总税换回自己算 / BM·PPN每行round2 / 发票金额核对）
 ==============================================================================
-相对 v2.9 的改动【仅计税部分】：
+相对 v2.10 的改动【仅计税部分】：
 
-【关税(BM)】
-    每行: bm = round2(AMOUNT × BM%)      ← 每行先标准四舍五入，再累加
-    汇总: sum_bm（消除浮点累积误差）
-
-【总税额】★ B方案核心
-    不再自己算 BM+PPN+PPH，改为：
-    逐行读取合同"税额"列（合同已算好 H×M+(H+H×M)×O，不含PPH）
-    汇总: sum_tax = Σ(税额列)
-    → 与合同 Excel 计算结果 0 误差
+★ 总税额算法换回 v2.9（自己算，不读合同"税额"列）：
+    每行:
+      BM  = round2(AMOUNT × BM%)
+      PPN = round2((AMOUNT + BM) × PPN%)
+      PPH = 不参与
+    汇总:
+      关税(BM) = Σ BM
+      总税额   = Σ(BM + PPN) = ΣBM + ΣPPN       ← 不含 PPH
+    每行 BM / PPN 先标准四舍五入再累加，消除浮点累积误差
 
 【保留未动】
     发票金额核对（总表H列 vs 合同GRAND TOTAL CIF，不一致备注"发票金额不一致"）
-    分表优先 attachment；合同只扫1次建索引；日志批量刷；标准四舍五入
+    分表优先 attachment；合同只扫1次建索引；日志批量刷
 ==============================================================================
 """
 import os
@@ -39,10 +39,7 @@ HEADER_ROW = 2
 DATA_START_ROW = 3
 DEBUG = True
 
-# ===== 核对发票金额：允许误差（元）=====
 AMT_TOL = 0.01
-
-# ===== 日志批量刷新参数 =====
 LOG_FLUSH_LINES = 20
 LOG_FLUSH_SECONDS = 0.3
 
@@ -294,10 +291,13 @@ def get_amount_fallback(rows):
 def read_contract(path, box=None):
     """
     返回 {bm, total_ex_pph, amount}
-    v2.10 计税规则：
-        关税(BM) = Σ round2(AMOUNT × BM%)          每行先四舍五入再累加
-        总税额   = Σ 合同"税额"列                    直接读合同算好的，0误差
-        发票金额 = 合计行 AMOUNT（用于核对）
+    v2.11 计税规则：
+        每行:
+          BM  = round2(AMOUNT × BM%)
+          PPN = round2((AMOUNT + BM) × PPN%)      ★ 每行先 round2
+        汇总:
+          关税(BM) = Σ BM
+          总税额   = Σ(BM + PPN)                    ← 不含 PPH
     """
     dbg(box, f"\n  读取合同: {os.path.basename(path)}")
     if not looks_like_xls_or_xlsx(path):
@@ -323,49 +323,49 @@ def read_contract(path, box=None):
     dbg(box, f"  表头: {[cell_text(v) for v in rows[hr-1]]}")
 
     used = set()
-    amt_col   = find_col_in_row(hdr, "AMOUNT", "金额", "CIF", used=used)
-    bm_col    = find_col_in_row(hdr, "BM可免", "BM", used=used) or find_col_in_row(hdr, "BM", used=used)
-    tax_col_c = find_col_in_row(hdr, "税额", "TAX", "合计税额", used=used)   # ★ 合同"税额"列
-    dbg(box, f"  列: AMOUNT={amt_col} BM={bm_col} 税额(合同)={tax_col_c}")
+    amt_col  = find_col_in_row(hdr, "AMOUNT", "金额", "CIF", used=used)
+    bm_col   = find_col_in_row(hdr, "BM可免", "BM", used=used) or find_col_in_row(hdr, "BM", used=used)
+    ppn_col  = find_col_in_row(hdr, "PPN", "VAT", "增值税", used=used)
+    pph_col  = find_col_in_row(hdr, "PPH", "WHT", used=used)   # 只读不用
+    dbg(box, f"  列: AMOUNT={amt_col} BM={bm_col} PPN={ppn_col} PPH={pph_col}(不进表)")
 
     grand, grand_row = get_grand_amount(rows, hr, amt_col)
     if not grand:
         grand = get_amount_fallback(rows)
     dbg(box, f"  合计行=第{grand_row}行  GRAND_AMOUNT={grand}")
 
-    # ===== v2.10 计算 =====
+    # ===== v2.11 计算：BM/PPN 每行 round2 后再累加 =====
     sum_bm = 0.0
-    sum_tax = 0.0
+    sum_ppn = 0.0
     for r in range(hr + 1, len(rows) + 1):
-        if r == grand_row:          # ★ 跳过合计行，避免把 GRAND 那行再算/再加一次
+        if r == grand_row:          # ★ 跳过合计行
             continue
         row = rows[r - 1]
-
-        # 关税(BM)：每行 round2 后再累加
         amt, _ = to_num(row[amt_col - 1]) if amt_col else (0.0, False)
         if not amt or amt <= 0:
             continue
+
         bm_raw = row[bm_col - 1] if bm_col else None
         if bm_raw is not None and str(bm_raw).strip() in ["免", "免征"]:
             bm_r = 0.0
         else:
             bm_r = to_rate(bm_raw)
-        bm = round2(amt * bm_r)
-        sum_bm += bm
 
-        # 总税额：直接读合同"税额"列（合同已算好，0误差）
-        if tax_col_c:
-            tax_val, _ = to_num(row[tax_col_c - 1])
-            sum_tax += tax_val if tax_val and tax_val > 0 else 0.0
+        ppn_r = to_rate(row[ppn_col - 1]) if ppn_col else 0.0
+
+        bm  = round2(amt * bm_r)
+        ppn = round2((amt + bm) * ppn_r)
+        sum_bm  += bm
+        sum_ppn += ppn
 
     info = {
         "amount": grand,
         "bm": round2(sum_bm),
         "pph": 0.0,
-        "total_ex_pph": round2(sum_tax),
+        "total_ex_pph": round2(sum_bm + sum_ppn),     # ★ = BM + PPN，不含 PPH
     }
     dbg(box, f"  → 关税(BM, 每行round2累加)={info['bm']}")
-    dbg(box, f"  → 总税(读合同税额列累加)={info['total_ex_pph']}")
+    dbg(box, f"  → 总税(BM+PPN, 每行round2累加, 不含PPH)={info['total_ex_pph']}")
     return info
 
 
@@ -536,7 +536,7 @@ def process(master_path, folder, box=None):
         # ① 关税金额 = Σ round2(AMOUNT×BM%)
         if duty_col:
             ws.cell(r, duty_col).value = info["bm"]
-        # ② 总税额 = Σ 合同"税额"列
+        # ② 总税额 = Σ(BM+PPN)，不含 PPH
         if tax_col:
             ws.cell(r, tax_col).value = info["total_ex_pph"]
         # ③ 增值税列：代码不填，清残留旧值
@@ -558,7 +558,7 @@ def process(master_path, folder, box=None):
                 dbg(box, f"  ✅ 发票金额核对一致：{master_amt}（合同 {info['amount']}）")
 
         processed += 1
-        dbg(box, f"  ✅ 关税(BM)={info['bm']}  总税(合同税额列)={info['total_ex_pph']}")
+        dbg(box, f"  ✅ 关税(BM)={info['bm']}  总税(不含PPH)={info['total_ex_pph']}")
 
     ts = datetime.now().strftime("%m%d_%H%M%S")
     stem = os.path.splitext(master_path)[0]
@@ -581,7 +581,7 @@ def gui():
     from tkinter import filedialog, messagebox, scrolledtext
 
     root = tk.Tk()
-    root.title("报关自动化工具 v2.10（B方案·读合同税额列 / 发票金额核对）")
+    root.title("报关自动化工具 v2.11（总税自算·每行round2 / 发票金额核对）")
     root.geometry("840x700")
     mv, fv = tk.StringVar(), tk.StringVar()
 
