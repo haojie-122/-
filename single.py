@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
 """
-报关自动化工具 v2.11（总税换回自己算 / BM·PPN每行round2 / 发票金额核对）
+报关自动化工具 v2.12（Decimal 全精度累加 / 末位单次 round2 / 发票金额核对）
 ==============================================================================
-相对 v2.10 的改动【仅计税部分】：
+相对 v2.11 的改动【仅计税精度，公式未变】：
 
-★ 总税额算法换回 v2.9（自己算，不读合同"税额"列）：
+★ 核心修正（解决"总税额差 0.0几"）：
+    累加阶段全程使用 Decimal 全精度，每行 BM / PPN 的小数点【全部参与相加】，
+    不在循环内做任何截断；循环结束后【只对总和 round2 一次】到分。
+    → 与"手工逐行用完整小数计算、最后合计再四舍五入"结果 0 误差。
+
+计税公式（与 v2.6~v2.11 完全一致，未变）：
     每行:
-      BM  = round2(AMOUNT × BM%)
-      PPN = round2((AMOUNT + BM) × PPN%)
-      PPH = 不参与
-    汇总:
+      BM  = AMOUNT × BM%
+      PPN = (AMOUNT + BM) × PPN%         ★ 每行都按完整小数算，不截断
+    汇总（Decimal 全精度累加后）:
       关税(BM) = Σ BM
-      总税额   = Σ(BM + PPN) = ΣBM + ΣPPN       ← 不含 PPH
-    每行 BM / PPN 先标准四舍五入再累加，消除浮点累积误差
+      总税额   = Σ(BM + PPN)              ← 不含 PPH
+    最后：
+      round2(关税) / round2(总税额)        ← 只在此处四舍五入一次
 
 【保留未动】
     发票金额核对（总表H列 vs 合同GRAND TOTAL CIF，不一致备注"发票金额不一致"）
@@ -48,13 +53,24 @@ _LAST_FLUSH = 0.0
 
 
 # ==================== 工具 ====================
-def round2(x):
+def D(x):
+    """转 Decimal，str() 中转避免 float 二进制误差"""
     if x is None:
-        return 0.0
+        return Decimal("0")
     try:
-        return float(Decimal(str(x)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+        return Decimal(str(x))
     except Exception:
-        return round(float(x), 2)
+        try:
+            return Decimal(str(float(x)))
+        except Exception:
+            return Decimal("0")
+
+
+def round2_dec(d):
+    """Decimal 四舍五入到 2 位，返回 float"""
+    if d is None:
+        return 0.0
+    return float(D(d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
 def dbg(box, s, force=False):
@@ -102,6 +118,7 @@ def norm(s):
 
 
 def to_num(x):
+    """转 float；(已废弃，改用 D() 做累加；此处仅给发票金额核对等简单场景使用)"""
     if x is None or str(x).strip() == "":
         return 0.0, False
     s = str(x).replace(",", "").replace(" ", "").replace("％", "%").strip()
@@ -116,13 +133,17 @@ def to_num(x):
     return v, is_pct
 
 
-def to_rate(x):
-    val, is_pct = to_num(x)
-    if val is None:
-        return 0.0
-    if is_pct or (val > 1 and val < 100):
-        return val / 100.0
-    return val
+def to_rate_dec(x):
+    """单元格 → Decimal 比率。值>1视为百分比(需/100)，否则已是小数"""
+    d = D(x)
+    if d == 0:
+        return Decimal("0")
+    # 判断是否带 % 符号
+    raw = str(x).replace(" ", "") if x is not None else ""
+    is_pct = "%" in raw
+    if is_pct or (d > 1 and d < 100):
+        return d / Decimal("100")
+    return d
 
 
 def looks_like_xls_or_xlsx(path):
@@ -291,13 +312,16 @@ def get_amount_fallback(rows):
 def read_contract(path, box=None):
     """
     返回 {bm, total_ex_pph, amount}
-    v2.11 计税规则：
-        每行:
-          BM  = round2(AMOUNT × BM%)
-          PPN = round2((AMOUNT + BM) × PPN%)      ★ 每行先 round2
-        汇总:
-          关税(BM) = Σ BM
-          总税额   = Σ(BM + PPN)                    ← 不含 PPH
+    v2.12 计税规则（Decimal 全精度累加，末位单次 round2）：
+        每行用完整小数计算（不截断）：
+          bm  = AMOUNT × BM%
+          ppn = (AMOUNT + bm) × PPN%
+        累加（Decimal，全精度，小数点全部参与相加）：
+          sum_bm  += bm
+          sum_ppn += ppn
+        循环结束，只对总和 round2 一次：
+          关税(BM) = round2(sum_bm)
+          总税额   = round2(sum_bm + sum_ppn)    ← 不含 PPH
     """
     dbg(box, f"\n  读取合同: {os.path.basename(path)}")
     if not looks_like_xls_or_xlsx(path):
@@ -334,38 +358,38 @@ def read_contract(path, box=None):
         grand = get_amount_fallback(rows)
     dbg(box, f"  合计行=第{grand_row}行  GRAND_AMOUNT={grand}")
 
-    # ===== v2.11 计算：BM/PPN 每行 round2 后再累加 =====
-    sum_bm = 0.0
-    sum_ppn = 0.0
+    # ===== v2.12 计算：Decimal 全精度累加，循环内不截断 =====
+    sum_bm  = Decimal("0")
+    sum_ppn = Decimal("0")
     for r in range(hr + 1, len(rows) + 1):
         if r == grand_row:          # ★ 跳过合计行
             continue
         row = rows[r - 1]
-        amt, _ = to_num(row[amt_col - 1]) if amt_col else (0.0, False)
-        if not amt or amt <= 0:
+        amt = D(row[amt_col - 1]) if amt_col else Decimal("0")
+        if amt <= 0:
             continue
 
         bm_raw = row[bm_col - 1] if bm_col else None
         if bm_raw is not None and str(bm_raw).strip() in ["免", "免征"]:
-            bm_r = 0.0
+            bm_r = Decimal("0")
         else:
-            bm_r = to_rate(bm_raw)
+            bm_r = to_rate_dec(bm_raw)
 
-        ppn_r = to_rate(row[ppn_col - 1]) if ppn_col else 0.0
+        ppn_r = to_rate_dec(row[ppn_col - 1]) if ppn_col else Decimal("0")
 
-        bm  = round2(amt * bm_r)
-        ppn = round2((amt + bm) * ppn_r)
+        bm  = amt * bm_r                      # ★ 完整小数，不截断
+        ppn = (amt + bm) * ppn_r             # ★ 完整小数，不截断
         sum_bm  += bm
         sum_ppn += ppn
 
     info = {
         "amount": grand,
-        "bm": round2(sum_bm),
+        "bm":  round2_dec(sum_bm),                                # ★ 只在此处 round2 一次
         "pph": 0.0,
-        "total_ex_pph": round2(sum_bm + sum_ppn),     # ★ = BM + PPN，不含 PPH
+        "total_ex_pph": round2_dec(sum_bm + sum_ppn),            # ★ 只在此处 round2 一次
     }
-    dbg(box, f"  → 关税(BM, 每行round2累加)={info['bm']}")
-    dbg(box, f"  → 总税(BM+PPN, 每行round2累加, 不含PPH)={info['total_ex_pph']}")
+    dbg(box, f"  → 关税(BM, 全精度累加后round2一次)={info['bm']}")
+    dbg(box, f"  → 总税(BM+PPN, 全精度累加后round2一次, 不含PPH)={info['total_ex_pph']}")
     return info
 
 
@@ -464,11 +488,11 @@ def find_contract_file(folder, ivpl, box=None):
 
 # ==================== 发票金额核对 ====================
 def check_amount(master_amount, contract_amount, tol=AMT_TOL):
-    if master_amount is None or contract_amount is None:
+    ma, _ = to_num(master_amount)
+    ca, _ = to_num(contract_amount)
+    if ma == 0 or ca == 0:
         return True, 0.0
-    if master_amount == 0 or contract_amount == 0:
-        return True, 0.0
-    diff = abs(float(master_amount) - float(contract_amount))
+    diff = abs(ma - ca)
     return diff <= tol, round(diff, 2)
 
 
@@ -533,10 +557,10 @@ def process(master_path, folder, box=None):
             skipped += 1
             continue
 
-        # ① 关税金额 = Σ round2(AMOUNT×BM%)
+        # ① 关税金额 = Σ BM（全精度累加后 round2 一次）
         if duty_col:
             ws.cell(r, duty_col).value = info["bm"]
-        # ② 总税额 = Σ(BM+PPN)，不含 PPH
+        # ② 总税额 = Σ(BM+PPN)，不含 PPH（全精度累加后 round2 一次）
         if tax_col:
             ws.cell(r, tax_col).value = info["total_ex_pph"]
         # ③ 增值税列：代码不填，清残留旧值
@@ -581,7 +605,7 @@ def gui():
     from tkinter import filedialog, messagebox, scrolledtext
 
     root = tk.Tk()
-    root.title("报关自动化工具 v2.11（总税自算·每行round2 / 发票金额核对）")
+    root.title("报关自动化工具 v2.12（Decimal全精度累加 / 发票金额核对）")
     root.geometry("840x700")
     mv, fv = tk.StringVar(), tk.StringVar()
 
